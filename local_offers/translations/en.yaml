@@ -1,20 +1,22 @@
 configuration:
   check_interval_hours:
-    name: Scrape interval (hours)
+    name: Check interval (hours)
   scan_on_start:
     name: Scan on start
   almacor_url:
     name: Almacor catalog URL
+  caracol_home_url:
+    name: Supermercados Caracol website
   heyzine_url:
-    name: Heyzine flipbook URL
+    name: Manual Heyzine URL (optional fallback)
   vision_enabled:
     name: Enable LLM Vision
   vision_api_base:
-    name: LLM API base URL
+    name: Vision API base URL
   vision_api_key:
-    name: LLM API key
+    name: Vision API key
   vision_model:
-    name: LLM Vision model
+    name: Vision model
   image_mode:
     name: Image mode
   render_dpi:
@@ -24,9 +26,9 @@ configuration:
   max_pages:
     name: Maximum pages
   llm_delay_seconds:
-    name: Delay between LLM calls (seconds)
+    name: Minimum delay between LLM calls (seconds)
   llm_max_retries:
-    name: LLM retries on overload
+    name: Maximum LLM retries
   llm_retry_backoff_seconds:
     name: LLM retry base backoff (seconds)
   notify_event:
