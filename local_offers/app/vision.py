@@ -43,11 +43,16 @@ confidence debe estar entre 0 y 1. Omití elementos decorativos que no sean prod
 """
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-# A valid 1x1 PNG. Used only by the API test so no catalog needs to exist first.
+# A valid 64x64 PNG. Used only by the API test so no catalog needs to exist first.
 TEST_IMAGE_DATA_URI = (
     "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zz0sAAAAASUVORK5CYII="
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAdklEQVR4nO3aQQqAMAwAQSP+/8v16lVEhsLOvZClp0BmrXXs7NQDfFWAVoBWgFaAVoBWgFaAdr19MDN/zPH0akXZ/gcK0ArQCtAK0ArQCtAK0ArQCtAK0ArQCtAK0ArQCtC2D5gOnrACtAK0ArQCtAK0ArTtA25PQAl7UMir8gAAAABJRU5ErkJggg=="
 )
+
+# One global gate for every LLM HTTP request (scan, retry and manual API test).
+# This prevents accidental concurrent requests and enforces the configured minimum spacing.
+_LLM_REQUEST_LOCK = asyncio.Lock()
+_LAST_LLM_REQUEST_AT = 0.0
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -110,6 +115,29 @@ def _retry_after_seconds(response: httpx.Response, fallback: float) -> float:
     return fallback
 
 
+async def _post_rate_limited(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    settings: Settings,
+) -> httpx.Response:
+    global _LAST_LLM_REQUEST_AT
+
+    async with _LLM_REQUEST_LOCK:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        remaining = settings.llm_delay_seconds - (now - _LAST_LLM_REQUEST_AT)
+        if _LAST_LLM_REQUEST_AT > 0 and remaining > 0:
+            LOGGER.info("Rate limit LLM: pausa de %.1f s", remaining)
+            await asyncio.sleep(remaining)
+
+        try:
+            return await client.post(endpoint, headers=headers, json=payload)
+        finally:
+            _LAST_LLM_REQUEST_AT = loop.time()
+
+
 async def _post_with_retries(
     client: httpx.AsyncClient,
     endpoint: str,
@@ -121,14 +149,14 @@ async def _post_with_retries(
     max_retries = settings.llm_max_retries
 
     for attempt in range(max_retries + 1):
-        response = await client.post(endpoint, headers=headers, json=current_payload)
+        response = await _post_rate_limited(client, endpoint, headers, current_payload, settings)
 
         # Some OpenAI-compatible endpoints accept vision but not response_format.
-        # Retry immediately once without it; this is a compatibility fallback, not a quota retry.
+        # Retry once without it; the global rate limiter also spaces this fallback call.
         if response.status_code == 400 and "response_format" in response.text.lower() and "response_format" in current_payload:
             current_payload = dict(current_payload)
             current_payload.pop("response_format", None)
-            response = await client.post(endpoint, headers=headers, json=current_payload)
+            response = await _post_rate_limited(client, endpoint, headers, current_payload, settings)
 
         if response.status_code not in RETRYABLE_STATUS or attempt >= max_retries:
             return response
