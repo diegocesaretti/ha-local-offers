@@ -4,14 +4,16 @@ Home Assistant App para detectar nuevos catálogos de supermercados locales, des
 
 ## Estado
 
-Versión inicial: `v0.1.0`.
+Versión actual: `v0.1.3`.
 
 Incluye fuentes para:
 
 - Almacor (`mailing.pdf`)
 - Catálogos Heyzine
 
-La App evita reprocesar un catálogo cuando el hash SHA-256 no cambió y permite usar proveedores Vision compatibles con OpenAI Chat Completions.
+Gemini (`gemini-3.6-flash`) es el proveedor/modelo predeterminado. La App incluye prueba de API LLM desde la Web UI, scraping semanal por defecto, rate limiting configurable, reintentos con backoff y detección de cambios por SHA-256 para no reprocesar catálogos sin cambios.
+
+También permite usar otros proveedores Vision compatibles con OpenAI Chat Completions.
 
 ## Instalación
 
