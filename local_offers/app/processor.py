@@ -9,7 +9,7 @@ from .config import Settings, load_settings
 from . import db
 from .ha import fire_catalog_event, publish_summary
 from .render import render_pdf
-from .sources import DownloadedCatalog, fetch_almacor, fetch_heyzine
+from .sources import DownloadedCatalog, fetch_almacor, fetch_caracol
 from .vision import analyze_image, deduplicate_products
 
 LOGGER = logging.getLogger(__name__)
@@ -33,7 +33,14 @@ class ScanManager:
                 results = []
                 jobs: list[tuple[str, Callable[[], Awaitable[DownloadedCatalog]]]] = [
                     ("Almacor", lambda: fetch_almacor(settings.almacor_url, CATALOG_ROOT)),
-                    ("Heyzine", lambda: fetch_heyzine(settings.heyzine_url, CATALOG_ROOT)),
+                    (
+                        "Caracol",
+                        lambda: fetch_caracol(
+                            settings.caracol_home_url,
+                            settings.heyzine_url,
+                            CATALOG_ROOT,
+                        ),
+                    ),
                 ]
                 for name, fetcher in jobs:
                     try:
@@ -65,11 +72,19 @@ class ScanManager:
                 "changed": False,
                 "catalog_id": existing["id"],
                 "message": "Catálogo sin cambios.",
+                "source_url": catalog.source_url,
             }
 
         if existing and (force or needs_processing):
             catalog_id = int(existing["id"])
-            db.update_catalog(catalog_id, status="processing", error=None)
+            db.update_catalog(
+                catalog_id,
+                status="processing",
+                error=None,
+                title=catalog.title,
+                source_url=catalog.source_url,
+                source=catalog.source,
+            )
         else:
             catalog_id = db.insert_catalog(
                 source=catalog.source,
@@ -106,9 +121,6 @@ class ScanManager:
             all_products: list[dict[str, Any]] = []
             valid_from = None
             valid_until = None
-
-            # Sequential by design. vision.py additionally enforces a global lock and
-            # the configured minimum delay between every outbound LLM HTTP request.
             for image in rendered:
                 parsed = await analyze_image(image.path, image.page, image.tile, settings)
                 valid_from = valid_from or parsed.get("catalog_valid_from")
@@ -123,6 +135,8 @@ class ScanManager:
                 valid_until=valid_until,
                 status="ready",
                 error=None,
+                source_url=catalog.source_url,
+                source=catalog.source,
             )
             if settings.notify_event:
                 await fire_catalog_event({
@@ -140,6 +154,7 @@ class ScanManager:
                 "offers": count,
                 "valid_from": valid_from,
                 "valid_until": valid_until,
+                "source_url": catalog.source_url,
             }
         except Exception as exc:
             db.update_catalog(catalog_id, status="error", error=str(exc))
