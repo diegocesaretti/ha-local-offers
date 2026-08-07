@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from . import db
 from .config import load_settings
 from .processor import ScanManager
-from .vision import test_vision_api
+from .vision import get_llm_metrics, test_vision_api
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,6 +37,11 @@ async def scheduler_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    try:
+        updated = db.refresh_history_metrics()
+        LOGGER.info("Métricas históricas actualizadas al iniciar: %s ofertas", updated)
+    except Exception:
+        LOGGER.exception("No se pudieron recalcular métricas históricas al iniciar")
     scheduler = asyncio.create_task(scheduler_loop())
     settings = load_settings()
     startup_task = None
@@ -50,7 +55,7 @@ async def lifespan(app: FastAPI):
             startup_task.cancel()
 
 
-app = FastAPI(title="Ofertas Locales", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Ofertas Locales", version="0.3.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -74,16 +79,21 @@ async def status():
         "stats": db.stats(),
         "catalogs": db.latest_catalogs(10),
         "last_result": manager.last_result,
+        "llm_metrics": get_llm_metrics(),
         "config": {
             "check_interval_hours": settings.check_interval_hours,
             "vision_enabled": settings.vision_enabled,
             "vision_api_base": settings.vision_api_base,
             "vision_model": settings.vision_model,
+            "vision_backup_enabled": settings.vision_backup_enabled,
+            "vision_backup_api_base": settings.vision_backup_api_base,
+            "vision_backup_model": settings.vision_backup_model,
             "image_mode": settings.image_mode,
             "almacor_url": settings.almacor_url,
             "caracol_home_url": settings.caracol_home_url,
             "heyzine_url": settings.heyzine_url,
             "api_key_configured": bool(settings.vision_api_key),
+            "backup_api_key_configured": bool(settings.vision_backup_api_key),
             "llm_delay_seconds": settings.llm_delay_seconds,
             "llm_max_retries": settings.llm_max_retries,
             "llm_retry_backoff_seconds": settings.llm_retry_backoff_seconds,
@@ -114,6 +124,19 @@ async def offers(source: str | None = None, q: str | None = None, limit: int = Q
 @app.get("/api/compare")
 async def compare(q: str | None = None, limit: int = Query(300, ge=1, le=1000)):
     return {"items": db.compare_current_offers(query=q, limit=limit)}
+
+
+@app.get("/api/deals")
+async def deals(q: str | None = None, limit: int = Query(300, ge=1, le=1000)):
+    return {"items": db.best_deals(query=q, limit=limit)}
+
+
+@app.get("/api/history/{offer_id}")
+async def offer_history(offer_id: int, limit: int = Query(50, ge=1, le=200)):
+    result = db.price_history_for_offer(offer_id, limit=limit)
+    if not result:
+        raise HTTPException(404, "Oferta no encontrada")
+    return result
 
 
 @app.get("/api/catalogs")
