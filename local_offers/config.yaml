@@ -1,6 +1,6 @@
 name: "Ofertas Locales"
 description: "Detecta catálogos de supermercados, extrae ofertas con LLM Vision y las integra con Home Assistant."
-version: "0.1.3"
+version: "0.2.0"
 slug: "local_offers"
 startup: application
 boot: auto
@@ -19,7 +19,8 @@ options:
   check_interval_hours: 168
   scan_on_start: false
   almacor_url: "https://almacor.com.ar/catalogo/mailing.pdf"
-  heyzine_url: "https://heyzine.com/flip-book/fafe2791cf.html"
+  caracol_home_url: "https://www.supercaracol.com.ar/"
+  heyzine_url: ""
   vision_enabled: false
   vision_api_base: "https://generativelanguage.googleapis.com/v1beta/openai"
   vision_api_key: ""
@@ -36,7 +37,8 @@ schema:
   check_interval_hours: "int(1,168)"
   scan_on_start: bool
   almacor_url: url
-  heyzine_url: url
+  caracol_home_url: url
+  heyzine_url: str?
   vision_enabled: bool
   vision_api_base: str
   vision_api_key: password
