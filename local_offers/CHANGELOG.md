@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0
+
+- Heyzine pasa a identificarse correctamente como **Caracol** en la UI, base de datos y eventos.
+- Descubrimiento automático del catálogo vigente desde `https://www.supercaracol.com.ar/`.
+- `heyzine_url` queda como fallback manual opcional si el sitio de Caracol no expone temporalmente el enlace.
+- Migración automática de registros históricos `Heyzine` → `Caracol`.
+- Nuevo modo **Comparar precios** entre Almacor y Caracol.
+- Matching conservador por marca, nombre y presentación; normaliza unidades como litros/ml/cc y kg/g.
+- La comparación muestra diferencia en pesos, porcentaje y supermercado más barato.
+- Gemini clasifica `is_food` y detecta evidencia visual `sin_tacc`.
+- `sin_tacc=true` sólo se acepta si el folleto muestra explícitamente logo/texto SIN TACC o declaración inequívoca de libre de gluten; sin evidencia queda como no verificado.
+- La Web UI suma filtros de alimentos y SIN TACC verificado.
+
 ## 0.1.3
 
 - Gemini queda como proveedor predeterminado con `gemini-3.6-flash`.
