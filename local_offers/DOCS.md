@@ -1,12 +1,21 @@
-# Ofertas Locales 0.1.3
+# Ofertas Locales 0.2.0
 
-## Instalación local
+## Qué hace
 
-Copiá la carpeta `local_offers` dentro de `/addons/local_offers` (o el directorio equivalente de Apps locales) y recargá la tienda de Apps. Luego instalá **Ofertas Locales**.
+La App monitorea los catálogos de **Almacor** y **Supermercados Caracol**, descarga los PDFs, los analiza con Gemini Vision y guarda las ofertas en SQLite para mostrarlas dentro de Home Assistant.
+
+## Caracol automático
+
+No hace falta cargar manualmente el ID de Heyzine. La App consulta:
+
+`https://www.supercaracol.com.ar/`
+
+y busca el enlace vigente a `heyzine.com/flip-book/...` publicado por Caracol. Luego descarga el PDF original desde Heyzine.
+
+- `caracol_home_url`: página donde Caracol publica el catálogo.
+- `heyzine_url`: fallback manual opcional. Puede quedar vacío.
 
 ## Configuración predeterminada
-
-La App usa Gemini como proveedor LLM predeterminado:
 
 - `vision_api_base`: `https://generativelanguage.googleapis.com/v1beta/openai`
 - `vision_model`: `gemini-3.6-flash`
@@ -15,65 +24,59 @@ La App usa Gemini como proveedor LLM predeterminado:
 - `llm_max_retries`: `3`
 - `llm_retry_backoff_seconds`: `5`
 
-La API key no viene configurada y `vision_enabled` permanece desactivado por seguridad hasta que cargues tu clave.
+La API key no viene configurada y `vision_enabled` permanece desactivado hasta que cargues tu clave.
+
+## Comparar precios
+
+La Web UI incluye el modo **Comparar precios**. Empareja ofertas actuales de Almacor y Caracol usando marca, nombre y presentación.
+
+La normalización contempla equivalencias de unidad como:
+
+- `2,25 L` ≈ `2250 ml` / `2250 cc`
+- `1 kg` ≈ `1000 g`
+
+La comparación muestra:
+
+- precio en Almacor,
+- precio en Caracol,
+- diferencia en pesos,
+- diferencia porcentual,
+- supermercado más barato,
+- texto de promoción de cada tienda.
+
+El matching es deliberadamente conservador: si la presentación parece diferente, no compara. En promociones complejas (2x1, segunda unidad, combos, etc.) se muestra el texto original porque el precio impreso no siempre equivale a un precio unitario comparable.
+
+## SIN TACC
+
+El LLM devuelve dos campos nuevos:
+
+- `is_food`: indica si el producto es alimento o bebida.
+- `sin_tacc`: evidencia de aptitud SIN TACC en el folleto.
+
+La regla es estricta:
+
+- `true`: sólo si se ve el logo/texto SIN TACC o declaración inequívoca de libre de gluten.
+- `false`: sólo si hay declaración inequívoca de que no es apto/contiene gluten.
+- `null`: no hay evidencia suficiente.
+
+La App **no infiere** aptitud SIN TACC por marca, tipo de alimento ni conocimiento previo. En la UI un alimento sin evidencia aparece como **SIN TACC no verificado**.
+
+Tras actualizar desde 0.1.x, usá una vez **Reanalizar** para que los catálogos actuales incorporen estos campos.
 
 ## Prueba de API LLM
 
-La Web UI incluye **Probar API LLM**. El test hace una petición multimodal mínima con una imagen diminuta para comprobar:
-
-1. URL/endpoint.
-2. API key.
-3. Modelo configurado.
-4. Soporte de entrada de imagen.
-
-No descarga ni procesa un catálogo durante esta prueba.
+La Web UI incluye **Probar API LLM**. El test hace una petición multimodal mínima para comprobar endpoint, API key, modelo y soporte de imagen sin procesar un catálogo.
 
 ## Control de carga y cuotas
 
-Las páginas se procesan de forma secuencial, nunca en paralelo.
+Las llamadas LLM pasan por un único limitador global y nunca se ejecutan simultáneamente.
 
-- `llm_delay_seconds`: pausa fija entre páginas/recortes.
-- `llm_max_retries`: cantidad de reintentos adicionales para HTTP 429/500/502/503/504.
-- `llm_retry_backoff_seconds`: espera inicial cuando la API no envía `Retry-After`. Los reintentos usan backoff exponencial.
-- Si la API devuelve `Retry-After`, la App respeta ese valor (hasta un máximo defensivo).
-
-## Otros proveedores
-
-### OpenAI
-
-- `vision_api_base`: `https://api.openai.com/v1`
-- `vision_model`: un modelo con entrada de imagen compatible con Chat Completions.
-
-### OpenRouter
-
-- `vision_api_base`: `https://openrouter.ai/api/v1`
-- `vision_model`: el identificador del modelo multimodal elegido en OpenRouter.
-
-## Modo de imagen
-
-- `full`: una llamada Vision por página. Es el modo recomendado para empezar.
-- `quarters`: divide cada página en cuatro recortes solapados. Aumenta legibilidad y cantidad de llamadas; se deduplican resultados iguales.
+- `llm_delay_seconds`: pausa mínima entre requests.
+- `llm_max_retries`: reintentos para HTTP 429/500/502/503/504.
+- `llm_retry_backoff_seconds`: espera base exponencial cuando la API no devuelve `Retry-After`.
 
 ## Home Assistant
 
-La App publica `sensor.local_offers` usando el proxy interno de Home Assistant y dispara `local_offers_catalog_updated` cuando termina de procesar un catálogo nuevo.
+La App publica `sensor.local_offers` y dispara `local_offers_catalog_updated` al procesar un catálogo nuevo.
 
-Ejemplo de automatización:
-
-```yaml
-triggers:
-  - trigger: event
-    event_type: local_offers_catalog_updated
-actions:
-  - action: notify.notify
-    data:
-      title: "Nuevo catálogo"
-      message: >-
-        {{ trigger.event.data.source }}: {{ trigger.event.data.offers }} ofertas detectadas.
-```
-
-## Limitaciones actuales
-
-- La App no descubre todavía un **nuevo ID de Heyzine** desde Facebook/Instagram/web de la tienda; procesa el URL configurado.
-- La extracción depende de la precisión del modelo Vision elegido.
-- No hay aún normalización avanzada entre nombres equivalentes ni histórico de “precio habitual”.
+> La extracción y el matching son automáticos, pero ante una diferencia importante conviene abrir el PDF desde la propia tabla y verificar presentación/promoción original.
