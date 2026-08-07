@@ -12,6 +12,7 @@ from typing import Any, Iterable
 
 
 DB_PATH = Path("/data/offers.db")
+HISTORY_MATCH_THRESHOLD = 0.66
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -47,12 +48,22 @@ CREATE TABLE IF NOT EXISTS offers (
     is_food INTEGER,
     sin_tacc INTEGER,
     confidence REAL,
+    history_count INTEGER DEFAULT 0,
+    historical_min REAL,
+    avg_30 REAL,
+    avg_60 REAL,
+    avg_90 REAL,
+    change_vs_avg_30 REAL,
+    change_vs_avg_60 REAL,
+    change_vs_avg_90 REAL,
+    deal_label TEXT,
     raw_json TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY(catalog_id) REFERENCES catalogs(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_offers_catalog ON offers(catalog_id);
 CREATE INDEX IF NOT EXISTS idx_offers_name ON offers(name);
+CREATE INDEX IF NOT EXISTS idx_offers_source ON offers(source);
 
 CREATE TABLE IF NOT EXISTS app_state (
     key TEXT PRIMARY KEY,
@@ -83,15 +94,40 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
-        _ensure_column(conn, "offers", "is_food", "INTEGER")
-        _ensure_column(conn, "offers", "sin_tacc", "INTEGER")
-        # v0.2 migration: Heyzine is only the publishing platform; the store is Caracol.
+        migrations = {
+            "is_food": "INTEGER",
+            "sin_tacc": "INTEGER",
+            "history_count": "INTEGER DEFAULT 0",
+            "historical_min": "REAL",
+            "avg_30": "REAL",
+            "avg_60": "REAL",
+            "avg_90": "REAL",
+            "change_vs_avg_30": "REAL",
+            "change_vs_avg_60": "REAL",
+            "change_vs_avg_90": "REAL",
+            "deal_label": "TEXT",
+        }
+        for column, definition in migrations.items():
+            _ensure_column(conn, "offers", column, definition)
+        # Heyzine is only the publishing platform; the actual store is Caracol.
         conn.execute("UPDATE catalogs SET source='Caracol' WHERE source='Heyzine'")
         conn.execute("UPDATE offers SET source='Caracol' WHERE source='Heyzine'")
 
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 def catalog_by_hash(sha256: str) -> dict[str, Any] | None:
@@ -142,7 +178,8 @@ def replace_offers(catalog_id: int, source: str, offers: Iterable[dict[str, Any]
             conn.execute(
                 """INSERT INTO offers
                    (catalog_id, source, page, brand, name, variant, presentation, price,
-                    previous_price, promotion_text, is_food, sin_tacc, confidence, raw_json, created_at)
+                    previous_price, promotion_text, is_food, sin_tacc, confidence,
+                    raw_json, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     catalog_id,
@@ -176,17 +213,23 @@ def list_offers(*, source: str | None = None, query: str | None = None, limit: i
     where = []
     args: list[Any] = []
     if current_only:
-        where.append("c.id = (SELECT c2.id FROM catalogs c2 WHERE c2.source=c.source AND c2.status='ready' ORDER BY c2.created_at DESC LIMIT 1)")
+        where.append(
+            "c.id = (SELECT c2.id FROM catalogs c2 WHERE c2.source=c.source "
+            "AND c2.status='ready' ORDER BY c2.created_at DESC LIMIT 1)"
+        )
     if source:
         where.append("o.source = ?")
         args.append(source)
     if query:
-        where.append("LOWER(COALESCE(o.brand,'') || ' ' || o.name || ' ' || COALESCE(o.variant,'')) LIKE ?")
+        where.append(
+            "LOWER(COALESCE(o.brand,'') || ' ' || o.name || ' ' || COALESCE(o.variant,'')) LIKE ?"
+        )
         args.append(f"%{query.lower()}%")
     clause = " WHERE " + " AND ".join(where) if where else ""
     args.append(limit)
     sql = f"""
-        SELECT o.*, c.valid_from, c.valid_until, c.source_url, c.title AS catalog_title
+        SELECT o.*, c.valid_from, c.valid_until, c.source_url,
+               c.title AS catalog_title, c.created_at AS catalog_created_at
         FROM offers o
         JOIN catalogs c ON c.id=o.catalog_id
         {clause}
@@ -215,13 +258,13 @@ def _product_text(item: dict[str, Any]) -> str:
 
 
 def _amount_signature(item: dict[str, Any]) -> tuple[str, float] | None:
-    text = _normalize_text(" ".join(
+    original = " ".join(
         str(item.get(k) or "") for k in ("presentation", "variant", "name")
-    ))
-    # Normalization removes comma/dot punctuation, so inspect the original text for decimals.
-    original = " ".join(str(item.get(k) or "") for k in ("presentation", "variant", "name")).lower()
-    original = original.replace(",", ".")
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(kg|kilos?|g|gr|gramos?|l|lt|lts|litros?|ml|cc|u|un|unidad(?:es)?)\b", original)
+    ).lower().replace(",", ".")
+    m = re.search(
+        r"(\d+(?:\.\d+)?)\s*(kg|kilos?|g|gr|gramos?|l|lt|lts|litros?|ml|cc|u|un|unidad(?:es)?)\b",
+        original,
+    )
     if m:
         value = float(m.group(1))
         unit = m.group(2)
@@ -234,7 +277,7 @@ def _amount_signature(item: dict[str, Any]) -> tuple[str, float] | None:
         if unit in {"ml", "cc"}:
             return ("volume", value)
         return ("count", value)
-    if re.search(r"\bkg\b", text):
+    if re.search(r"\bkg\b", _normalize_text(original)):
         return ("weight", 1000.0)
     return None
 
@@ -318,18 +361,13 @@ def compare_current_offers(query: str | None = None, limit: int = 300) -> list[d
         pc = float(best["price"])
         difference = abs(pa - pc)
         if pa < pc:
-            cheaper = "Almacor"
-            cheaper_price = pa
+            cheaper, cheaper_price = "Almacor", pa
         elif pc < pa:
-            cheaper = "Caracol"
-            cheaper_price = pc
+            cheaper, cheaper_price = "Caracol", pc
         else:
-            cheaper = "Igual"
-            cheaper_price = pa
+            cheaper, cheaper_price = "Igual", pa
         difference_percent = (difference / cheaper_price * 100.0) if cheaper_price else 0.0
-        verified_sources = [
-            item["source"] for item in (a, best) if item.get("sin_tacc") == 1
-        ]
+        verified_sources = [item["source"] for item in (a, best) if item.get("sin_tacc") == 1]
         matches.append({
             "name": display_name,
             "match_score": round(best_score, 3),
@@ -346,14 +384,242 @@ def compare_current_offers(query: str | None = None, limit: int = 300) -> list[d
     return matches[:limit]
 
 
+def _window_average(observations: list[dict[str, Any]], reference: datetime, days: int) -> float | None:
+    prices: list[float] = []
+    for obs in observations:
+        dt = _parse_dt(obs.get("catalog_created_at"))
+        if not dt:
+            continue
+        age = (reference - dt).total_seconds() / 86400.0
+        if 0 <= age <= days and obs.get("price") is not None:
+            prices.append(float(obs["price"]))
+    return (sum(prices) / len(prices)) if prices else None
+
+
+def _pct_change(current: float, baseline: float | None) -> float | None:
+    if baseline is None or baseline == 0:
+        return None
+    return ((current - baseline) / baseline) * 100.0
+
+
+def _compute_price_metrics(
+    current_price: float | None,
+    observations: list[dict[str, Any]],
+    reference_at: datetime | None = None,
+) -> dict[str, Any]:
+    if current_price is None:
+        return {
+            "history_count": 0,
+            "historical_min": None,
+            "avg_30": None,
+            "avg_60": None,
+            "avg_90": None,
+            "change_vs_avg_30": None,
+            "change_vs_avg_60": None,
+            "change_vs_avg_90": None,
+            "deal_label": "sin_precio",
+        }
+
+    valid = [x for x in observations if x.get("price") is not None]
+    current = float(current_price)
+    if not valid:
+        return {
+            "history_count": 0,
+            "historical_min": None,
+            "avg_30": None,
+            "avg_60": None,
+            "avg_90": None,
+            "change_vs_avg_30": None,
+            "change_vs_avg_60": None,
+            "change_vs_avg_90": None,
+            "deal_label": "sin_historial",
+        }
+
+    reference = reference_at or datetime.now(timezone.utc)
+    previous_prices = [float(x["price"]) for x in valid]
+    previous_min = min(previous_prices)
+    avg_30 = _window_average(valid, reference, 30)
+    avg_60 = _window_average(valid, reference, 60)
+    avg_90 = _window_average(valid, reference, 90)
+    fallback_avg = sum(previous_prices) / len(previous_prices)
+    baseline = avg_90 or avg_60 or avg_30 or fallback_avg
+    delta = _pct_change(current, baseline)
+
+    if current < previous_min * 0.995:
+        label = "nuevo_minimo"
+    elif current <= previous_min * 1.005:
+        label = "minimo_historico"
+    elif delta is not None and delta <= -10:
+        label = "muy_buena"
+    elif delta is not None and delta <= -5:
+        label = "buena"
+    elif delta is not None and delta >= 5:
+        label = "por_encima"
+    else:
+        label = "normal"
+
+    return {
+        "history_count": len(valid),
+        "historical_min": round(previous_min, 2),
+        "avg_30": round(avg_30, 2) if avg_30 is not None else None,
+        "avg_60": round(avg_60, 2) if avg_60 is not None else None,
+        "avg_90": round(avg_90, 2) if avg_90 is not None else None,
+        "change_vs_avg_30": round(_pct_change(current, avg_30), 1) if avg_30 else None,
+        "change_vs_avg_60": round(_pct_change(current, avg_60), 1) if avg_60 else None,
+        "change_vs_avg_90": round(_pct_change(current, avg_90), 1) if avg_90 else None,
+        "deal_label": label,
+    }
+
+
+def _historical_matches(
+    conn: sqlite3.Connection,
+    current: dict[str, Any],
+    limit_catalogs: int = 200,
+) -> list[dict[str, Any]]:
+    target_dt = _parse_dt(current.get("catalog_created_at")) or datetime.now(timezone.utc)
+    rows = [dict(r) for r in conn.execute(
+        """
+        SELECT o.*, c.created_at AS catalog_created_at, c.valid_from, c.valid_until,
+               c.title AS catalog_title
+        FROM offers o
+        JOIN catalogs c ON c.id=o.catalog_id
+        WHERE o.source=? AND o.catalog_id<>? AND c.status='ready'
+          AND c.created_at < ? AND o.price IS NOT NULL
+        ORDER BY c.created_at DESC
+        """,
+        (current["source"], current["catalog_id"], target_dt.isoformat()),
+    ).fetchall()]
+
+    # Keep only the best matching occurrence from each catalog.
+    best_by_catalog: dict[int, tuple[float, dict[str, Any]]] = {}
+    for row in rows:
+        score = _match_score(current, row)
+        if score < HISTORY_MATCH_THRESHOLD:
+            continue
+        cid = int(row["catalog_id"])
+        old = best_by_catalog.get(cid)
+        if old is None or score > old[0]:
+            copy = dict(row)
+            copy["match_score"] = round(score, 3)
+            best_by_catalog[cid] = (score, copy)
+    matches = [value[1] for value in best_by_catalog.values()]
+    matches.sort(key=lambda x: x.get("catalog_created_at") or "", reverse=True)
+    return matches[:limit_catalogs]
+
+
+def refresh_history_metrics(source: str | None = None) -> int:
+    where = [
+        "c.status='ready'",
+        "c.id=(SELECT c2.id FROM catalogs c2 WHERE c2.source=c.source AND c2.status='ready' "
+        "ORDER BY c2.created_at DESC LIMIT 1)",
+    ]
+    args: list[Any] = []
+    if source:
+        where.append("o.source=?")
+        args.append(source)
+
+    with connect() as conn:
+        current_rows = [dict(r) for r in conn.execute(
+            f"""
+            SELECT o.*, c.created_at AS catalog_created_at
+            FROM offers o JOIN catalogs c ON c.id=o.catalog_id
+            WHERE {' AND '.join(where)}
+            """,
+            args,
+        ).fetchall()]
+        for current in current_rows:
+            observations = _historical_matches(conn, current)
+            metrics = _compute_price_metrics(
+                current.get("price"),
+                observations,
+                _parse_dt(current.get("catalog_created_at")),
+            )
+            conn.execute(
+                """UPDATE offers SET
+                   history_count=?, historical_min=?, avg_30=?, avg_60=?, avg_90=?,
+                   change_vs_avg_30=?, change_vs_avg_60=?, change_vs_avg_90=?, deal_label=?
+                   WHERE id=?""",
+                (
+                    metrics["history_count"], metrics["historical_min"], metrics["avg_30"],
+                    metrics["avg_60"], metrics["avg_90"], metrics["change_vs_avg_30"],
+                    metrics["change_vs_avg_60"], metrics["change_vs_avg_90"],
+                    metrics["deal_label"], current["id"],
+                ),
+            )
+        return len(current_rows)
+
+
+def price_history_for_offer(offer_id: int, limit: int = 50) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT o.*, c.created_at AS catalog_created_at, c.valid_from, c.valid_until,
+                      c.title AS catalog_title
+               FROM offers o JOIN catalogs c ON c.id=o.catalog_id WHERE o.id=?""",
+            (offer_id,),
+        ).fetchone()
+        if not row:
+            return None
+        current = dict(row)
+        observations = _historical_matches(conn, current, limit_catalogs=limit)
+        return {
+            "offer": current,
+            "name": _display_name(current),
+            "metrics": {
+                "history_count": current.get("history_count") or 0,
+                "historical_min": current.get("historical_min"),
+                "avg_30": current.get("avg_30"),
+                "avg_60": current.get("avg_60"),
+                "avg_90": current.get("avg_90"),
+                "change_vs_avg_30": current.get("change_vs_avg_30"),
+                "change_vs_avg_60": current.get("change_vs_avg_60"),
+                "change_vs_avg_90": current.get("change_vs_avg_90"),
+                "deal_label": current.get("deal_label"),
+            },
+            "observations": observations,
+        }
+
+
+def best_deals(query: str | None = None, limit: int = 300) -> list[dict[str, Any]]:
+    items = list_offers(query=query, limit=1000)
+    rank = {
+        "nuevo_minimo": 6,
+        "minimo_historico": 5,
+        "muy_buena": 4,
+        "buena": 3,
+        "normal": 2,
+        "por_encima": 1,
+        "sin_historial": 0,
+        "sin_precio": 0,
+        None: 0,
+    }
+    items.sort(
+        key=lambda x: (
+            rank.get(x.get("deal_label"), 0),
+            -(x.get("change_vs_avg_90") if x.get("change_vs_avg_90") is not None else 9999),
+            x.get("history_count") or 0,
+        ),
+        reverse=True,
+    )
+    return items[:limit]
+
+
 def get_catalog(catalog_id: int) -> dict[str, Any] | None:
     with connect() as conn:
         row = conn.execute("SELECT * FROM catalogs WHERE id=?", (catalog_id,)).fetchone()
         return dict(row) if row else None
 
 
+def get_offer(offer_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM offers WHERE id=?", (offer_id,)).fetchone()
+        return dict(row) if row else None
+
+
 def stats() -> dict[str, Any]:
-    current_filter = "c.id = (SELECT c2.id FROM catalogs c2 WHERE c2.source=c.source AND c2.status='ready' ORDER BY c2.created_at DESC LIMIT 1)"
+    current_filter = (
+        "c.id = (SELECT c2.id FROM catalogs c2 WHERE c2.source=c.source AND c2.status='ready' "
+        "ORDER BY c2.created_at DESC LIMIT 1)"
+    )
     with connect() as conn:
         total_offers = conn.execute(
             f"SELECT COUNT(*) FROM offers o JOIN catalogs c ON c.id=o.catalog_id WHERE {current_filter}"
@@ -364,7 +630,15 @@ def stats() -> dict[str, Any]:
         by_source = {
             row[0]: row[1]
             for row in conn.execute(
-                f"SELECT o.source, COUNT(*) FROM offers o JOIN catalogs c ON c.id=o.catalog_id WHERE {current_filter} GROUP BY o.source"
+                f"SELECT o.source, COUNT(*) FROM offers o JOIN catalogs c ON c.id=o.catalog_id "
+                f"WHERE {current_filter} GROUP BY o.source"
+            ).fetchall()
+        }
+        deals_by_label = {
+            (row[0] or "sin_historial"): row[1]
+            for row in conn.execute(
+                f"SELECT o.deal_label, COUNT(*) FROM offers o JOIN catalogs c ON c.id=o.catalog_id "
+                f"WHERE {current_filter} GROUP BY o.deal_label"
             ).fetchall()
         }
         return {
@@ -373,13 +647,15 @@ def stats() -> dict[str, Any]:
             "catalogs": total_catalogs,
             "last_update": latest[0] if latest else None,
             "by_source": by_source,
+            "deals_by_label": deals_by_label,
         }
 
 
 def set_state(key: str, value: str) -> None:
     with connect() as conn:
         conn.execute(
-            "INSERT INTO app_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            "INSERT INTO app_state(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
 
