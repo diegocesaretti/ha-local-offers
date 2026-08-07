@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,13 @@ Cada precio debe asociarse al producto visualmente correspondiente. Conservá pr
 Los precios argentinos pueden usar punto como separador de miles: $ 3.499 significa 3499.
 No hagas cálculos de descuentos: sólo extraé lo impreso.
 
+Además clasificá si el producto es alimento o bebida en is_food.
+Para sin_tacc aplicá una regla estricta de evidencia visual:
+- true SOLO si se ve explícitamente el logo oficial SIN TACC, las palabras SIN TACC o una declaración inequívoca de libre de gluten en ese producto/oferta.
+- false SOLO si el folleto declara inequívocamente que no es apto / contiene gluten.
+- null si no hay evidencia visible suficiente. NUNCA infieras que un alimento es SIN TACC por marca, tipo de producto o conocimiento previo.
+- para productos que no sean alimento/bebida usá is_food=false y sin_tacc=null.
+
 Respondé exactamente con este objeto:
 {
   "catalog_valid_from": "YYYY-MM-DD o null",
@@ -35,6 +43,8 @@ Respondé exactamente con este objeto:
       "price": 0.0,
       "previous_price": 0.0,
       "promotion_text": "string o null",
+      "is_food": true,
+      "sin_tacc": true,
       "confidence": 0.0
     }
   ]
@@ -43,14 +53,11 @@ confidence debe estar entre 0 y 1. Omití elementos decorativos que no sean prod
 """
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-# A valid 64x64 PNG. Used only by the API test so no catalog needs to exist first.
 TEST_IMAGE_DATA_URI = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAdklEQVR4nO3aQQqAMAwAQSP+/8v16lVEhsLOvZClp0BmrXXs7NQDfFWAVoBWgFaAVoBWgFaAdr19MDN/zPH0akXZ/gcK0ArQCtAK0ArQCtAK0ArQCtAK0ArQCtAK0ArQCtC2D5gOnrACtAK0ArQCtAK0ArTtA25PQAl7UMir8gAAAABJRU5ErkJggg=="
 )
 
-# One global gate for every LLM HTTP request (scan, retry and manual API test).
-# This prevents accidental concurrent requests and enforces the configured minimum spacing.
 _LLM_REQUEST_LOCK = asyncio.Lock()
 _LAST_LLM_REQUEST_AT = 0.0
 
@@ -82,8 +89,6 @@ def _vision_endpoint(settings: Settings) -> str:
     if not re.match(r"^https?://", base, flags=re.I):
         base = "https://" + base
 
-    # Gemini OpenAI compatibility: accept either the base URL or the full
-    # /chat/completions URL and always normalize to Google's canonical endpoint.
     if "generativelanguage.googleapis.com" in base.lower():
         return "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
@@ -115,27 +120,23 @@ def _retry_after_seconds(response: httpx.Response, fallback: float) -> float:
     return fallback
 
 
-async def _post_rate_limited(
+async def _rate_limited_post(
     client: httpx.AsyncClient,
     endpoint: str,
     headers: dict[str, str],
     payload: dict[str, Any],
-    settings: Settings,
+    delay_seconds: float,
 ) -> httpx.Response:
     global _LAST_LLM_REQUEST_AT
-
     async with _LLM_REQUEST_LOCK:
-        loop = asyncio.get_running_loop()
-        now = loop.time()
-        remaining = settings.llm_delay_seconds - (now - _LAST_LLM_REQUEST_AT)
-        if _LAST_LLM_REQUEST_AT > 0 and remaining > 0:
-            LOGGER.info("Rate limit LLM: pausa de %.1f s", remaining)
-            await asyncio.sleep(remaining)
-
+        now = time.monotonic()
+        wait = max(0.0, float(delay_seconds) - (now - _LAST_LLM_REQUEST_AT))
+        if wait:
+            await asyncio.sleep(wait)
         try:
             return await client.post(endpoint, headers=headers, json=payload)
         finally:
-            _LAST_LLM_REQUEST_AT = loop.time()
+            _LAST_LLM_REQUEST_AT = time.monotonic()
 
 
 async def _post_with_retries(
@@ -149,14 +150,16 @@ async def _post_with_retries(
     max_retries = settings.llm_max_retries
 
     for attempt in range(max_retries + 1):
-        response = await _post_rate_limited(client, endpoint, headers, current_payload, settings)
+        response = await _rate_limited_post(
+            client, endpoint, headers, current_payload, settings.llm_delay_seconds
+        )
 
-        # Some OpenAI-compatible endpoints accept vision but not response_format.
-        # Retry once without it; the global rate limiter also spaces this fallback call.
         if response.status_code == 400 and "response_format" in response.text.lower() and "response_format" in current_payload:
             current_payload = dict(current_payload)
             current_payload.pop("response_format", None)
-            response = await _post_rate_limited(client, endpoint, headers, current_payload, settings)
+            response = await _rate_limited_post(
+                client, endpoint, headers, current_payload, settings.llm_delay_seconds
+            )
 
         if response.status_code not in RETRYABLE_STATUS or attempt >= max_retries:
             return response
@@ -202,7 +205,6 @@ def _raise_api_error(response: httpx.Response, endpoint: str) -> None:
 
 
 async def test_vision_api(settings: Settings) -> dict[str, Any]:
-    """Make a tiny multimodal request to validate endpoint, key, model and image input."""
     if not settings.vision_api_key:
         raise RuntimeError("vision_api_key está vacío.")
 
@@ -282,11 +284,12 @@ async def analyze_image(path: Path, page: int, tile: str, settings: Settings) ->
     for item in products:
         item["page"] = page
         item["tile"] = tile
+        if not item.get("is_food"):
+            item["sin_tacc"] = None
     return parsed
 
 
 def deduplicate_products(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Conservative dedupe for overlapping quarter tiles."""
     seen: set[tuple] = set()
     out: list[dict[str, Any]] = []
     for item in products:
