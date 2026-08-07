@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0
+
+- Segundo perfil LLM Vision opcional de respaldo con failover automático.
+- Métricas persistentes de éxito/falla del principal y backup, cantidad de failovers y último proveedor usado.
+- El botón **Probar APIs LLM** valida ambos perfiles sin alterar las métricas de uso real.
+- Política de reintentos con defaults 5 s → 10 s → 60 s; respeta un `Retry-After` mayor.
+- Checkpoints persistentes por página/recorte: un escaneo interrumpido continúa desde lo pendiente en vez de empezar de cero.
+- `Reanalizar` limpia checkpoints de extracción para forzar una lectura completa.
+- Histórico de precios por producto/presentación usando los catálogos guardados.
+- Mínimo histórico, promedio 30/60/90 días, variaciones porcentuales y cantidad de observaciones.
+- Clasificación de oportunidades: nuevo mínimo, mínimo histórico, muy buena, buena, normal, sobre promedio y sin historial.
+- Nueva vista **Histórico / oportunidades** y detalle de observaciones anteriores.
+- La comparación Almacor ↔ Caracol incorpora contexto histórico de cada precio.
+- SIN TACC pasa a una segunda etapa: primero se arma la base de productos/precios; después se verifica evidencia visual sólo para alimentos ya guardados.
+- La verificación SIN TACC tiene checkpoints propios y sus fallas no invalidan los precios ya extraídos.
+
 ## 0.2.0
 
 - Heyzine pasa a identificarse correctamente como **Caracol** en la UI, base de datos y eventos.
