@@ -25,12 +25,8 @@ Cada precio debe asociarse al producto visualmente correspondiente. Conservá pr
 Los precios argentinos pueden usar punto como separador de miles: $ 3.499 significa 3499.
 No hagas cálculos de descuentos: sólo extraé lo impreso.
 
-Además clasificá si el producto es alimento o bebida en is_food.
-Para sin_tacc aplicá una regla estricta de evidencia visual:
-- true SOLO si se ve explícitamente el logo oficial SIN TACC, las palabras SIN TACC o una declaración inequívoca de libre de gluten en ese producto/oferta.
-- false SOLO si el folleto declara inequívocamente que no es apto / contiene gluten.
-- null si no hay evidencia visible suficiente. NUNCA infieras que un alimento es SIN TACC por marca, tipo de producto o conocimiento previo.
-- para productos que no sean alimento/bebida usá is_food=false y sin_tacc=null.
+Clasificá también si cada producto es alimento o bebida usando is_food.
+NO determines SIN TACC en esta etapa: la verificación de gluten se hace después, sobre la base de datos ya armada.
 
 Respondé exactamente con este objeto:
 {
@@ -46,12 +42,27 @@ Respondé exactamente con este objeto:
       "previous_price": 0.0,
       "promotion_text": "string o null",
       "is_food": true,
-      "sin_tacc": true,
       "confidence": 0.0
     }
   ]
 }
 confidence debe estar entre 0 y 1. Omití elementos decorativos que no sean productos ofertados.
+"""
+
+SIN_TACC_SYSTEM_PROMPT = """Sos un verificador visual de evidencia SIN TACC en folletos argentinos.
+Recibís una imagen del folleto y una lista de productos YA extraídos de la base de datos, cada uno con un ID.
+Tu única tarea es decidir si JUNTO A ESE PRODUCTO se ve evidencia explícita sobre gluten.
+
+Reglas estrictas:
+- true SOLO si se ve claramente logo/texto SIN TACC o una declaración inequívoca de libre de gluten asociada a ese producto.
+- false SOLO si se ve una declaración inequívoca de que NO es apto / contiene gluten asociada a ese producto.
+- null si no se ve evidencia suficiente, el logo es ambiguo, está lejos del producto o no podés asociarlo con seguridad.
+- Nunca uses conocimiento de marca, ingredientes habituales ni supongas que un alimento naturalmente sin gluten es apto.
+- No cambies nombre, precio ni clasificación del producto.
+
+Respondé exactamente:
+{"results":[{"id":123,"sin_tacc":true}]}
+Incluí todos los IDs recibidos; usá null cuando no haya evidencia.
 """
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
@@ -79,22 +90,16 @@ class VisionProfile:
 
 
 def _primary_profile(settings: Settings) -> VisionProfile:
-    return VisionProfile(
-        name="primary",
-        enabled=True,
-        api_base=settings.vision_api_base,
-        api_key=settings.vision_api_key,
-        model=settings.vision_model,
-    )
+    return VisionProfile("primary", True, settings.vision_api_base, settings.vision_api_key, settings.vision_model)
 
 
 def _backup_profile(settings: Settings) -> VisionProfile:
     return VisionProfile(
-        name="backup",
-        enabled=settings.vision_backup_enabled,
-        api_base=settings.vision_backup_api_base,
-        api_key=settings.vision_backup_api_key,
-        model=settings.vision_backup_model,
+        "backup",
+        settings.vision_backup_enabled,
+        settings.vision_backup_api_base,
+        settings.vision_backup_api_key,
+        settings.vision_backup_model,
     )
 
 
@@ -162,8 +167,7 @@ def _extract_json(text: str) -> dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
+        start, end = text.find("{"), text.rfind("}")
         if start >= 0 and end > start:
             return json.loads(text[start:end + 1])
         raise
@@ -187,40 +191,39 @@ def _endpoint_from_base(api_base: str) -> str:
 
 
 def _vision_endpoint(value: Settings | str) -> str:
-    """Backward-compatible helper used by tests and older code."""
     if isinstance(value, Settings):
         return _endpoint_from_base(value.vision_api_base)
     return _endpoint_from_base(str(value))
 
 
 def _headers(profile: VisionProfile) -> dict[str, str]:
-    headers = {
-        "Authorization": f"Bearer {profile.api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {profile.api_key}", "Content-Type": "application/json"}
     if "openrouter.ai" in profile.api_base.lower():
         headers["HTTP-Referer"] = "https://www.home-assistant.io/"
         headers["X-Title"] = "Home Assistant - Ofertas Locales"
     return headers
 
 
+def _retry_fallback_seconds(attempt: int, base: float) -> float:
+    """Wait before retry N. Retry 1=base, retry 2=2*base, retry 3=60s, then 120/240..."""
+    if attempt < 2:
+        return float(base) * (2 ** attempt)
+    return min(60.0 * (2 ** (attempt - 2)), 300.0)
+
+
 def _retry_after_seconds(response: httpx.Response, fallback: float) -> float:
     value = response.headers.get("Retry-After")
     if value:
         try:
-            return max(0.0, min(float(value), 300.0))
+            # Never retry sooner than our local policy; respect a longer server request.
+            return max(fallback, min(float(value), 300.0))
         except ValueError:
             pass
     return fallback
 
 
-async def _rate_limited_post(
-    client: httpx.AsyncClient,
-    endpoint: str,
-    headers: dict[str, str],
-    payload: dict[str, Any],
-    delay_seconds: float,
-) -> httpx.Response:
+async def _rate_limited_post(client: httpx.AsyncClient, endpoint: str, headers: dict[str, str],
+                             payload: dict[str, Any], delay_seconds: float) -> httpx.Response:
     global _LAST_LLM_REQUEST_AT
     async with _LLM_REQUEST_LOCK:
         now = time.monotonic()
@@ -233,38 +236,22 @@ async def _rate_limited_post(
             _LAST_LLM_REQUEST_AT = time.monotonic()
 
 
-async def _post_with_retries(
-    client: httpx.AsyncClient,
-    endpoint: str,
-    headers: dict[str, str],
-    payload: dict[str, Any],
-    settings: Settings,
-) -> httpx.Response:
+async def _post_with_retries(client: httpx.AsyncClient, endpoint: str, headers: dict[str, str],
+                             payload: dict[str, Any], settings: Settings) -> httpx.Response:
     current_payload = payload
     for attempt in range(settings.llm_max_retries + 1):
-        response = await _rate_limited_post(
-            client, endpoint, headers, current_payload, settings.llm_delay_seconds
-        )
-        if (
-            response.status_code == 400
-            and "response_format" in response.text.lower()
-            and "response_format" in current_payload
-        ):
+        response = await _rate_limited_post(client, endpoint, headers, current_payload, settings.llm_delay_seconds)
+        if response.status_code == 400 and "response_format" in response.text.lower() and "response_format" in current_payload:
             current_payload = dict(current_payload)
             current_payload.pop("response_format", None)
-            response = await _rate_limited_post(
-                client, endpoint, headers, current_payload, settings.llm_delay_seconds
-            )
+            response = await _rate_limited_post(client, endpoint, headers, current_payload, settings.llm_delay_seconds)
         if response.status_code not in RETRYABLE_STATUS or attempt >= settings.llm_max_retries:
             return response
-        fallback = settings.llm_retry_backoff_seconds * (2 ** attempt)
+        fallback = _retry_fallback_seconds(attempt, settings.llm_retry_backoff_seconds)
         wait_seconds = _retry_after_seconds(response, fallback)
         LOGGER.warning(
             "LLM API HTTP %s; reintento %s/%s en %.1f s",
-            response.status_code,
-            attempt + 1,
-            settings.llm_max_retries,
-            wait_seconds,
+            response.status_code, attempt + 1, settings.llm_max_retries, wait_seconds,
         )
         await asyncio.sleep(wait_seconds)
     return response
@@ -274,10 +261,7 @@ def _response_content(data: dict[str, Any]) -> str:
     try:
         content = data["choices"][0]["message"]["content"]
         if isinstance(content, list):
-            content = "".join(
-                part.get("text", "") if isinstance(part, dict) else str(part)
-                for part in content
-            )
+            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
         return str(content)
     except Exception as exc:
         raise RuntimeError(f"Respuesta Vision inesperada: {str(data)[:1000]}") from exc
@@ -290,54 +274,64 @@ def _raise_api_error(response: httpx.Response, endpoint: str, profile: VisionPro
     hint = ""
     if response.status_code == 404 and "generativelanguage.googleapis.com" in endpoint:
         hint = " Verificá el modelo configurado y que la clave pertenezca a Gemini API/Google AI Studio."
-    raise RuntimeError(
-        f"{profile.name} ({profile.model}) devolvió HTTP {response.status_code}: {body}{hint}"
-    )
+    raise RuntimeError(f"{profile.name} ({profile.model}) devolvió HTTP {response.status_code}: {body}{hint}")
 
 
-async def _call_profile(
-    profile: VisionProfile,
-    payload: dict[str, Any],
-    settings: Settings,
-    timeout: float,
-) -> str:
+async def _call_profile(profile: VisionProfile, payload: dict[str, Any], settings: Settings, timeout: float) -> str:
     if not profile.enabled:
         raise RuntimeError(f"Perfil {profile.name} desactivado.")
-    if not profile.api_base:
-        raise RuntimeError(f"Perfil {profile.name}: URL base vacía.")
-    if not profile.api_key:
-        raise RuntimeError(f"Perfil {profile.name}: API key vacía.")
-    if not profile.model:
-        raise RuntimeError(f"Perfil {profile.name}: modelo vacío.")
-
+    if not profile.api_base or not profile.api_key or not profile.model:
+        raise RuntimeError(f"Perfil {profile.name} incompleto: falta URL, API key o modelo.")
     endpoint = _endpoint_from_base(profile.api_base)
     request_payload = dict(payload)
     request_payload["model"] = profile.model
     LOGGER.info("Vision %s -> %s | model=%s", profile.name, endpoint, profile.model)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await _post_with_retries(
-            client, endpoint, _headers(profile), request_payload, settings
-        )
+        response = await _post_with_retries(client, endpoint, _headers(profile), request_payload, settings)
         _raise_api_error(response, endpoint, profile)
         data = response.json()
     return _response_content(data)
 
 
+async def _call_with_failover(payload: dict[str, Any], settings: Settings, timeout: float,
+                              count_metrics: bool = True) -> tuple[str, VisionProfile]:
+    primary, backup = _primary_profile(settings), _backup_profile(settings)
+    try:
+        content = await _call_profile(primary, payload, settings, timeout)
+        if count_metrics:
+            _record_provider_result("primary", True)
+        return content, primary
+    except Exception as primary_exc:
+        primary_error = str(primary_exc)
+        if count_metrics:
+            _record_provider_result("primary", False, primary_error)
+        LOGGER.warning("LLM principal falló; evaluando backup: %s", primary_error)
+        if not backup.configured:
+            raise RuntimeError(f"LLM principal falló y no hay backup configurado: {primary_error}") from primary_exc
+        if count_metrics:
+            _record_failover()
+        try:
+            content = await _call_profile(backup, payload, settings, timeout)
+            if count_metrics:
+                _record_provider_result("backup", True)
+            LOGGER.info("Failover LLM exitoso -> backup model=%s", backup.model)
+            return content, backup
+        except Exception as backup_exc:
+            backup_error = str(backup_exc)
+            if count_metrics:
+                _record_provider_result("backup", False, backup_error)
+            raise RuntimeError(
+                f"Fallaron ambos perfiles LLM. Principal: {primary_error} | Backup: {backup_error}"
+            ) from backup_exc
+
+
 def _test_payload() -> dict[str, Any]:
     return {
         "response_format": {"type": "json_object"},
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Prueba de conectividad Vision. Respondé sólo JSON: {\"ok\": true}",
-                    },
-                    {"type": "image_url", "image_url": {"url": TEST_IMAGE_DATA_URI}},
-                ],
-            }
-        ],
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Prueba de conectividad Vision. Respondé sólo JSON: {\"ok\": true}"},
+            {"type": "image_url", "image_url": {"url": TEST_IMAGE_DATA_URI}},
+        ]}],
     }
 
 
@@ -345,42 +339,22 @@ async def _test_profile(profile: VisionProfile, settings: Settings) -> dict[str,
     if not profile.enabled:
         return {"enabled": False, "configured": False, "ok": None, "name": profile.name}
     if not profile.configured:
-        return {
-            "enabled": True,
-            "configured": False,
-            "ok": False,
-            "name": profile.name,
-            "model": profile.model or None,
-            "error": "Perfil incompleto: falta URL, API key o modelo.",
-        }
+        return {"enabled": True, "configured": False, "ok": False, "name": profile.name,
+                "model": profile.model or None, "error": "Perfil incompleto: falta URL, API key o modelo."}
     try:
         content = await _call_profile(profile, _test_payload(), settings, timeout=60)
         parsed = _extract_json(content)
-        return {
-            "enabled": True,
-            "configured": True,
-            "ok": True,
-            "name": profile.name,
-            "model": profile.model,
-            "endpoint": _endpoint_from_base(profile.api_base),
-            "response": parsed,
-        }
+        return {"enabled": True, "configured": True, "ok": True, "name": profile.name,
+                "model": profile.model, "endpoint": _endpoint_from_base(profile.api_base), "response": parsed}
     except Exception as exc:
-        return {
-            "enabled": True,
-            "configured": True,
-            "ok": False,
-            "name": profile.name,
-            "model": profile.model,
-            "error": str(exc),
-        }
+        return {"enabled": True, "configured": True, "ok": False, "name": profile.name,
+                "model": profile.model, "error": str(exc)}
 
 
 async def test_vision_api(settings: Settings) -> dict[str, Any]:
     primary = await _test_profile(_primary_profile(settings), settings)
     backup = await _test_profile(_backup_profile(settings), settings)
-    usable = bool(primary.get("ok") or backup.get("ok"))
-    return {"ok": usable, "primary": primary, "backup": backup}
+    return {"ok": bool(primary.get("ok") or backup.get("ok")), "primary": primary, "backup": backup}
 
 
 def _analysis_payload(path: Path, page: int, tile: str) -> dict[str, Any]:
@@ -394,72 +368,82 @@ def _analysis_payload(path: Path, page: int, tile: str) -> dict[str, Any]:
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {"type": "image_url", "image_url": {"url": _data_uri(path), "detail": "high"}},
-                ],
-            },
+            {"role": "user", "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": _data_uri(path), "detail": "high"}},
+            ]},
         ],
     }
-
-
-async def _analyze_with_profile(
-    profile: VisionProfile,
-    payload: dict[str, Any],
-    settings: Settings,
-) -> dict[str, Any]:
-    content = await _call_profile(profile, payload, settings, timeout=120)
-    parsed = _extract_json(content)
-    if not isinstance(parsed.get("products", []), list):
-        raise RuntimeError(f"Perfil {profile.name}: JSON válido pero products no es una lista.")
-    parsed["provider_used"] = profile.name
-    parsed["provider_model"] = profile.model
-    return parsed
 
 
 async def analyze_image(path: Path, page: int, tile: str, settings: Settings) -> dict[str, Any]:
     if not settings.vision_enabled:
         return {"catalog_valid_from": None, "catalog_valid_until": None, "products": []}
-
-    payload = _analysis_payload(path, page, tile)
-    primary = _primary_profile(settings)
-    backup = _backup_profile(settings)
-
-    try:
-        parsed = await _analyze_with_profile(primary, payload, settings)
-        _record_provider_result("primary", True)
-    except Exception as primary_exc:
-        primary_error = str(primary_exc)
-        _record_provider_result("primary", False, primary_error)
-        LOGGER.warning("LLM principal falló; evaluando backup: %s", primary_error)
-        if not backup.configured:
-            raise RuntimeError(
-                f"LLM principal falló y no hay backup configurado: {primary_error}"
-            ) from primary_exc
-        _record_failover()
-        try:
-            parsed = await _analyze_with_profile(backup, payload, settings)
-            _record_provider_result("backup", True)
-            LOGGER.info("Failover LLM exitoso -> backup model=%s", backup.model)
-        except Exception as backup_exc:
-            backup_error = str(backup_exc)
-            _record_provider_result("backup", False, backup_error)
-            raise RuntimeError(
-                "Fallaron ambos perfiles LLM. "
-                f"Principal: {primary_error} | Backup: {backup_error}"
-            ) from backup_exc
-
-    products = parsed.get("products") or []
-    for item in products:
+    content, profile = await _call_with_failover(_analysis_payload(path, page, tile), settings, timeout=120)
+    parsed = _extract_json(content)
+    if not isinstance(parsed.get("products", []), list):
+        raise RuntimeError(f"Perfil {profile.name}: JSON válido pero products no es una lista.")
+    parsed["provider_used"] = profile.name
+    parsed["provider_model"] = profile.model
+    for item in parsed.get("products") or []:
         item["page"] = page
         item["tile"] = tile
-        item["llm_provider"] = parsed.get("provider_used")
-        item["llm_model"] = parsed.get("provider_model")
-        if not item.get("is_food"):
-            item["sin_tacc"] = None
+        item["llm_provider"] = profile.name
+        item["llm_model"] = profile.model
+        item["sin_tacc"] = None
     return parsed
+
+
+def _sin_tacc_payload(path: Path, offers: list[dict[str, Any]]) -> dict[str, Any]:
+    product_list = [
+        {
+            "id": int(item["id"]),
+            "product": " ".join(str(item.get(k) or "").strip() for k in ("brand", "name", "variant", "presentation") if str(item.get(k) or "").strip()),
+        }
+        for item in offers
+    ]
+    return {
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": SIN_TACC_SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Productos de esta imagen:\n" + json.dumps(product_list, ensure_ascii=False)},
+                {"type": "image_url", "image_url": {"url": _data_uri(path), "detail": "high"}},
+            ]},
+        ],
+    }
+
+
+async def verify_sin_tacc_image(path: Path, offers: list[dict[str, Any]], settings: Settings) -> dict[str, Any]:
+    """Second pass, only after offers already exist in SQLite. Returns results keyed by DB offer ID."""
+    food = [x for x in offers if x.get("is_food") in (1, True)]
+    if not food:
+        return {"results": [], "provider_used": None, "provider_model": None}
+    content, profile = await _call_with_failover(_sin_tacc_payload(path, food), settings, timeout=120)
+    parsed = _extract_json(content)
+    results = parsed.get("results")
+    if not isinstance(results, list):
+        raise RuntimeError(f"Verificación SIN TACC ({profile.name}): results no es una lista.")
+    allowed_ids = {int(x["id"]) for x in food}
+    normalized = []
+    seen: set[int] = set()
+    for row in results:
+        try:
+            oid = int(row.get("id"))
+        except Exception:
+            continue
+        if oid not in allowed_ids or oid in seen:
+            continue
+        value = row.get("sin_tacc")
+        if value not in (True, False, None):
+            value = None
+        normalized.append({"id": oid, "sin_tacc": value})
+        seen.add(oid)
+    # IDs omitted by the model are explicitly left unverified.
+    for oid in allowed_ids - seen:
+        normalized.append({"id": oid, "sin_tacc": None})
+    return {"results": normalized, "provider_used": profile.name, "provider_model": profile.model}
 
 
 def deduplicate_products(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
