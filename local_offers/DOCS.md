@@ -1,82 +1,132 @@
-# Ofertas Locales 0.2.0
+# Ofertas Locales 0.3.0
 
 ## Qué hace
 
-La App monitorea los catálogos de **Almacor** y **Supermercados Caracol**, descarga los PDFs, los analiza con Gemini Vision y guarda las ofertas en SQLite para mostrarlas dentro de Home Assistant.
+La App monitorea los catálogos de **Almacor** y **Supermercados Caracol**, descarga los PDFs, los analiza con LLM Vision y guarda ofertas e histórico de precios en SQLite dentro de Home Assistant.
 
 ## Caracol automático
 
-No hace falta cargar manualmente el ID de Heyzine. La App consulta:
+La App consulta `https://www.supercaracol.com.ar/`, busca el enlace vigente a `heyzine.com/flip-book/...` publicado por Caracol y descarga el PDF original.
 
-`https://www.supercaracol.com.ar/`
+- `caracol_home_url`: web donde Caracol publica el catálogo.
+- `heyzine_url`: fallback manual opcional; normalmente puede quedar vacío.
 
-y busca el enlace vigente a `heyzine.com/flip-book/...` publicado por Caracol. Luego descarga el PDF original desde Heyzine.
+## LLM principal + respaldo
 
-- `caracol_home_url`: página donde Caracol publica el catálogo.
-- `heyzine_url`: fallback manual opcional. Puede quedar vacío.
+La App admite dos perfiles Vision:
 
-## Configuración predeterminada
+- principal: `vision_api_base`, `vision_api_key`, `vision_model`
+- respaldo: `vision_backup_api_base`, `vision_backup_api_key`, `vision_backup_model`
 
-- `vision_api_base`: `https://generativelanguage.googleapis.com/v1beta/openai`
-- `vision_model`: `gemini-3.6-flash`
-- scraping programado: cada `168` horas (7 días)
-- `llm_delay_seconds`: `2`
-- `llm_max_retries`: `3`
-- `llm_retry_backoff_seconds`: `5`
+Activá el segundo con `vision_backup_enabled: true`.
 
-La API key no viene configurada y `vision_enabled` permanece desactivado hasta que cargues tu clave.
+El perfil principal siempre se intenta primero. Si agota sus reintentos o devuelve una respuesta inválida, la misma página/recorte se procesa con el perfil de respaldo. La página siguiente vuelve a intentar primero el principal.
 
-## Comparar precios
+La Web UI muestra métricas persistentes de uso real:
 
-La Web UI incluye el modo **Comparar precios**. Empareja ofertas actuales de Almacor y Caracol usando marca, nombre y presentación.
+- éxitos/fallas del principal,
+- éxitos/fallas del respaldo,
+- cantidad de failovers,
+- último proveedor usado.
 
-La normalización contempla equivalencias de unidad como:
+El botón **Probar APIs LLM** prueba ambos perfiles pero no altera estas métricas.
+
+## Control de carga y reintentos
+
+Las llamadas LLM pasan por un único limitador global y nunca salen simultáneamente.
+
+Con los defaults actuales:
+
+- pausa normal entre llamadas: `2 s`
+- reintento 1: `5 s`
+- reintento 2: `10 s`
+- reintento 3: `60 s`
+
+Si el servidor devuelve `Retry-After` mayor, la App respeta el tiempo más largo. Reintentos posteriores, si se configuran más de tres, continúan 120/240 s con tope defensivo de 300 s.
+
+## Checkpoints y reanudación
+
+Cada página/recorte extraído correctamente se guarda inmediatamente como checkpoint persistente en `/data/checkpoints`.
+
+Si falla el LLM, se reinicia el contenedor o Home Assistant se interrumpe durante un catálogo:
+
+- los resultados ya correctos no se pierden,
+- al próximo escaneo del mismo PDF se reutilizan,
+- sólo se vuelven a enviar al LLM las páginas/recortes pendientes.
+
+El botón **Reanalizar** (`force`) sí borra los checkpoints de extracción del catálogo para obligar una lectura completa desde cero.
+
+## Comparar precios Almacor ↔ Caracol
+
+La vista **Comparar precios** empareja de forma conservadora ofertas actuales usando marca, nombre y presentación.
+
+Ejemplos normalizados:
 
 - `2,25 L` ≈ `2250 ml` / `2250 cc`
 - `1 kg` ≈ `1000 g`
 
-La comparación muestra:
+Si la presentación es claramente distinta no se compara. Las promociones complejas (2x1, segunda unidad, combos) conservan su texto original para evitar interpretar mal el precio unitario.
 
-- precio en Almacor,
-- precio en Caracol,
-- diferencia en pesos,
-- diferencia porcentual,
-- supermercado más barato,
-- texto de promoción de cada tienda.
+## Histórico y detección de ofertas reales
 
-El matching es deliberadamente conservador: si la presentación parece diferente, no compara. En promociones complejas (2x1, segunda unidad, combos, etc.) se muestra el texto original porque el precio impreso no siempre equivale a un precio unitario comparable.
+La App conserva los catálogos anteriores y usa una observación por catálogo para construir el histórico de cada producto/presentación.
 
-## SIN TACC
+Para cada oferta actual calcula, cuando hay datos suficientes:
 
-El LLM devuelve dos campos nuevos:
+- mínimo histórico anterior,
+- promedio de 30 días,
+- promedio de 60 días,
+- promedio de 90 días,
+- variación porcentual contra esos promedios,
+- cantidad de observaciones previas.
 
-- `is_food`: indica si el producto es alimento o bebida.
-- `sin_tacc`: evidencia de aptitud SIN TACC en el folleto.
+La UI clasifica el precio actual como:
 
-La regla es estricta:
+- **Nuevo mínimo**
+- **En mínimo histórico**
+- **Muy buena oferta**
+- **Buena oferta**
+- **Precio normal**
+- **Sobre el promedio**
+- **Sin historial**
 
-- `true`: sólo si se ve el logo/texto SIN TACC o declaración inequívoca de libre de gluten.
-- `false`: sólo si hay declaración inequívoca de que no es apto/contiene gluten.
+La vista **Histórico / oportunidades** ordena primero las mejores oportunidades y permite abrir el detalle de observaciones anteriores de cada producto.
+
+El matching histórico usa el mismo criterio conservador de producto/presentación que la comparación entre tiendas para evitar mezclar, por ejemplo, una botella de 1,5 L con una de 2,25 L.
+
+## SIN TACC en segunda pasada
+
+La verificación SIN TACC ya no forma parte de la extracción inicial.
+
+Proceso:
+
+1. Vision extrae productos, precios, promociones y `is_food`.
+2. La App consolida y guarda esa base en SQLite.
+3. Sólo entonces hace una segunda pasada LLM sobre los alimentos/bebidas ya guardados, usando sus IDs de base de datos.
+4. Esa segunda pasada mira la página/recorte correspondiente y completa `sin_tacc`.
+
+Regla estricta:
+
+- `true`: sólo evidencia visual explícita SIN TACC/libre de gluten asociada al producto.
+- `false`: sólo declaración explícita de no apto/contiene gluten.
 - `null`: no hay evidencia suficiente.
 
-La App **no infiere** aptitud SIN TACC por marca, tipo de alimento ni conocimiento previo. En la UI un alimento sin evidencia aparece como **SIN TACC no verificado**.
+No se infiere aptitud por marca, ingredientes supuestos o tipo de alimento.
 
-Tras actualizar desde 0.1.x, usá una vez **Reanalizar** para que los catálogos actuales incorporen estos campos.
+La segunda pasada también tiene checkpoints. Si falla, el catálogo y sus precios siguen disponibles; los productos afectados aparecen como **SIN TACC no verificado** y la App intenta completar únicamente los recortes pendientes en un próximo escaneo.
 
-## Prueba de API LLM
+## Configuración base
 
-La Web UI incluye **Probar API LLM**. El test hace una petición multimodal mínima para comprobar endpoint, API key, modelo y soporte de imagen sin procesar un catálogo.
-
-## Control de carga y cuotas
-
-Las llamadas LLM pasan por un único limitador global y nunca se ejecutan simultáneamente.
-
-- `llm_delay_seconds`: pausa mínima entre requests.
-- `llm_max_retries`: reintentos para HTTP 429/500/502/503/504.
-- `llm_retry_backoff_seconds`: espera base exponencial cuando la API no devuelve `Retry-After`.
+- scraping: `168` horas (7 días)
+- Gemini directo como perfil principal por defecto
+- backup desactivado hasta cargar sus credenciales/modelo
+- `image_mode: full`
+- `llm_delay_seconds: 2`
+- `llm_max_retries: 3`
+- `llm_retry_backoff_seconds: 5`
 
 ## Home Assistant
 
-La App publica `sensor.local_offers` y dispara `local_offers_catalog_updated` al procesar un catálogo nuevo.
+La App publica `sensor.local_offers` y dispara `local_offers_catalog_updated` al procesar un catálogo.
 
-> La extracción y el matching son automáticos, pero ante una diferencia importante conviene abrir el PDF desde la propia tabla y verificar presentación/promoción original.
+> La extracción, matching e histórico son automáticos, pero en promociones complejas o diferencias importantes conviene abrir el PDF original desde la propia UI.
