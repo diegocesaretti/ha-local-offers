@@ -62,13 +62,25 @@ def _data_uri(path: Path) -> str:
     return f"data:image/jpeg;base64,{b64}"
 
 
+def _vision_endpoint(settings: Settings) -> str:
+    base = str(settings.vision_api_base or "").strip().strip('"').strip("'")
+    if not base:
+        raise RuntimeError("vision_api_base está vacío.")
+    if not re.match(r"^https?://", base, flags=re.I):
+        base = "https://" + base
+    endpoint = base.rstrip("/") + "/chat/completions"
+    if not re.match(r"^https?://", endpoint, flags=re.I):
+        raise RuntimeError(f"vision_api_base inválido: {settings.vision_api_base!r}")
+    return endpoint
+
+
 async def analyze_image(path: Path, page: int, tile: str, settings: Settings) -> dict[str, Any]:
     if not settings.vision_enabled:
         return {"catalog_valid_from": None, "catalog_valid_until": None, "products": []}
     if not settings.vision_api_key:
         raise RuntimeError("Vision está activado pero vision_api_key está vacío.")
 
-    endpoint = settings.vision_api_base.rstrip("/") + "/chat/completions"
+    endpoint = _vision_endpoint(settings)
     headers = {
         "Authorization": f"Bearer {settings.vision_api_key}",
         "Content-Type": "application/json",
@@ -98,6 +110,8 @@ async def analyze_image(path: Path, page: int, tile: str, settings: Settings) ->
             },
         ],
     }
+
+    LOGGER.info("Vision request -> %s | model=%s | page=%s | tile=%s", endpoint, settings.vision_model, page, tile)
 
     async with httpx.AsyncClient(timeout=120) as client:
         response = await client.post(endpoint, headers=headers, json=payload)
