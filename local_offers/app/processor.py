@@ -107,13 +107,9 @@ class ScanManager:
             valid_from = None
             valid_until = None
 
-            # Sequential by design: avoids API bursts and keeps memory usage modest on a Pi.
-            # A configurable pause is added between images/tiles to further protect API quotas.
-            for idx, image in enumerate(rendered):
-                if idx > 0 and settings.llm_delay_seconds > 0:
-                    LOGGER.info("Pausa LLM de %s s antes de la siguiente imagen", settings.llm_delay_seconds)
-                    await asyncio.sleep(settings.llm_delay_seconds)
-
+            # Sequential by design. vision.py additionally enforces a global lock and
+            # the configured minimum delay between every outbound LLM HTTP request.
+            for image in rendered:
                 parsed = await analyze_image(image.path, image.page, image.tile, settings)
                 valid_from = valid_from or parsed.get("catalog_valid_from")
                 valid_until = valid_until or parsed.get("catalog_valid_until")
