@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html as html_lib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +11,7 @@ import fitz
 import httpx
 
 
-USER_AGENT = "HA-Local-Offers/0.1 (+Home Assistant App)"
+USER_AGENT = "HA-Local-Offers/0.2 (+Home Assistant App)"
 
 
 @dataclass
@@ -54,11 +55,50 @@ async def fetch_almacor(url: str, root: Path) -> DownloadedCatalog:
     return DownloadedCatalog("Almacor", url, None, "Almacor", pdf_path, digest, page_count)
 
 
+def discover_caracol_catalog_url(html: str) -> str:
+    """Find the current Heyzine flipbook linked by Supermercados Caracol.
+
+    The Caracol home page exposes the active catalog through a banner/menu link.
+    We intentionally return a canonical URL without tracking parameters so a
+    Facebook fbclid change cannot look like a new catalog.
+    """
+    decoded = html_lib.unescape(html)
+    hrefs = re.findall(r'href\s*=\s*["\']([^"\']+)["\']', decoded, flags=re.I)
+    candidates: list[str] = []
+    for href in hrefs:
+        href = href.strip()
+        if href.startswith("//"):
+            href = "https:" + href
+        if "heyzine.com/flip-book/" not in href.lower():
+            continue
+        m = re.search(r"https?://(?:www\.)?heyzine\.com/flip-book/[A-Za-z0-9_-]+\.html", href, flags=re.I)
+        if m:
+            candidates.append(m.group(0))
+    if not candidates:
+        # Fallback for unusual inline JS or unquoted markup.
+        m = re.search(
+            r"https?://(?:www\.)?heyzine\.com/flip-book/[A-Za-z0-9_-]+\.html",
+            decoded,
+            flags=re.I,
+        )
+        if m:
+            candidates.append(m.group(0))
+    if not candidates:
+        raise ValueError("No se encontró un enlace de catálogo Heyzine en la web de Caracol.")
+    return candidates[0]
+
+
+async def discover_caracol_catalog(home_url: str) -> str:
+    async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
+        response = await client.get(home_url, follow_redirects=True, timeout=30)
+        response.raise_for_status()
+        return discover_caracol_catalog_url(response.text)
+
+
 def extract_heyzine_info(html: str, source_url: str) -> dict:
     cfg_pattern = r"var\s+flipbookcfg\s*=\s*({[\s\S]+?});[\s]*(?:/\*|var)"
     cfg_match = re.search(cfg_pattern, html, re.DOTALL)
     if not cfg_match:
-        # Fallback for small markup changes: stop at semicolon only.
         cfg_match = re.search(r"var\s+flipbookcfg\s*=\s*({[\s\S]+?});", html, re.DOTALL)
     if not cfg_match:
         raise ValueError("No se encontró flipbookcfg en Heyzine.")
@@ -90,7 +130,7 @@ def extract_heyzine_info(html: str, source_url: str) -> dict:
     }
 
 
-async def fetch_heyzine(url: str, root: Path) -> DownloadedCatalog:
+async def _fetch_heyzine_pdf(url: str, root: Path, source_name: str, folder_name: str) -> DownloadedCatalog:
     async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
         page = await client.get(url, follow_redirects=True, timeout=30)
         page.raise_for_status()
@@ -108,9 +148,24 @@ async def fetch_heyzine(url: str, root: Path) -> DownloadedCatalog:
 
     digest = sha256_bytes(data)
     external_id = info.get("id") or digest[:12]
-    folder = root / "heyzine" / safe_id(external_id)
+    folder = root / folder_name / safe_id(external_id)
     folder.mkdir(parents=True, exist_ok=True)
     pdf_path = folder / "catalog.pdf"
     pdf_path.write_bytes(data)
     page_count = len(fitz.open(stream=data, filetype="pdf"))
-    return DownloadedCatalog("Heyzine", url, external_id, info.get("title"), pdf_path, digest, page_count)
+    return DownloadedCatalog(source_name, url, external_id, info.get("title"), pdf_path, digest, page_count)
+
+
+async def fetch_heyzine(url: str, root: Path) -> DownloadedCatalog:
+    """Backward-compatible direct Heyzine fetch; exposed as Caracol in v0.2+."""
+    return await _fetch_heyzine_pdf(url, root, "Caracol", "caracol")
+
+
+async def fetch_caracol(home_url: str, fallback_heyzine_url: str, root: Path) -> DownloadedCatalog:
+    try:
+        catalog_url = await discover_caracol_catalog(home_url)
+    except Exception:
+        if not fallback_heyzine_url:
+            raise
+        catalog_url = fallback_heyzine_url
+    return await _fetch_heyzine_pdf(catalog_url, root, "Caracol", "caracol")
