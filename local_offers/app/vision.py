@@ -215,7 +215,6 @@ def _retry_after_seconds(response: httpx.Response, fallback: float) -> float:
     value = response.headers.get("Retry-After")
     if value:
         try:
-            # Never retry sooner than our local policy; respect a longer server request.
             return max(fallback, min(float(value), 300.0))
         except ValueError:
             pass
@@ -240,11 +239,27 @@ async def _post_with_retries(client: httpx.AsyncClient, endpoint: str, headers: 
                              payload: dict[str, Any], settings: Settings) -> httpx.Response:
     current_payload = payload
     for attempt in range(settings.llm_max_retries + 1):
-        response = await _rate_limited_post(client, endpoint, headers, current_payload, settings.llm_delay_seconds)
-        if response.status_code == 400 and "response_format" in response.text.lower() and "response_format" in current_payload:
-            current_payload = dict(current_payload)
-            current_payload.pop("response_format", None)
-            response = await _rate_limited_post(client, endpoint, headers, current_payload, settings.llm_delay_seconds)
+        try:
+            response = await _rate_limited_post(
+                client, endpoint, headers, current_payload, settings.llm_delay_seconds
+            )
+            if response.status_code == 400 and "response_format" in response.text.lower() and "response_format" in current_payload:
+                current_payload = dict(current_payload)
+                current_payload.pop("response_format", None)
+                response = await _rate_limited_post(
+                    client, endpoint, headers, current_payload, settings.llm_delay_seconds
+                )
+        except httpx.RequestError as exc:
+            if attempt >= settings.llm_max_retries:
+                raise
+            wait_seconds = _retry_fallback_seconds(attempt, settings.llm_retry_backoff_seconds)
+            LOGGER.warning(
+                "LLM error de transporte %s; reintento %s/%s en %.1f s",
+                type(exc).__name__, attempt + 1, settings.llm_max_retries, wait_seconds,
+            )
+            await asyncio.sleep(wait_seconds)
+            continue
+
         if response.status_code not in RETRYABLE_STATUS or attempt >= settings.llm_max_retries:
             return response
         fallback = _retry_fallback_seconds(attempt, settings.llm_retry_backoff_seconds)
@@ -398,7 +413,11 @@ def _sin_tacc_payload(path: Path, offers: list[dict[str, Any]]) -> dict[str, Any
     product_list = [
         {
             "id": int(item["id"]),
-            "product": " ".join(str(item.get(k) or "").strip() for k in ("brand", "name", "variant", "presentation") if str(item.get(k) or "").strip()),
+            "product": " ".join(
+                str(item.get(k) or "").strip()
+                for k in ("brand", "name", "variant", "presentation")
+                if str(item.get(k) or "").strip()
+            ),
         }
         for item in offers
     ]
@@ -440,7 +459,6 @@ async def verify_sin_tacc_image(path: Path, offers: list[dict[str, Any]], settin
             value = None
         normalized.append({"id": oid, "sin_tacc": value})
         seen.add(oid)
-    # IDs omitted by the model are explicitly left unverified.
     for oid in allowed_ids - seen:
         normalized.append({"id": oid, "sin_tacc": None})
     return {"results": normalized, "provider_used": profile.name, "provider_model": profile.model}
