@@ -1,6 +1,6 @@
 configuration:
   check_interval_hours:
-    name: Intervalo de chequeo (horas)
+    name: Intervalo de scraping (horas)
   scan_on_start:
     name: Escanear al iniciar
   almacor_url:
@@ -10,11 +10,11 @@ configuration:
   vision_enabled:
     name: Activar LLM Vision
   vision_api_base:
-    name: URL base de la API Vision
+    name: URL base de la API LLM
   vision_api_key:
-    name: Clave de API Vision
+    name: Clave de API LLM
   vision_model:
-    name: Modelo Vision
+    name: Modelo LLM Vision
   image_mode:
     name: Modo de imagen
   render_dpi:
@@ -23,5 +23,11 @@ configuration:
     name: Calidad JPEG
   max_pages:
     name: Máximo de páginas
+  llm_delay_seconds:
+    name: Pausa entre llamadas LLM (segundos)
+  llm_max_retries:
+    name: Reintentos LLM ante sobrecarga
+  llm_retry_backoff_seconds:
+    name: Espera base para reintentos LLM (segundos)
   notify_event:
     name: Disparar evento en Home Assistant
