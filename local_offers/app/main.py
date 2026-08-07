@@ -25,8 +25,6 @@ STATIC = Path(__file__).parent / "static"
 
 
 async def scheduler_loop() -> None:
-    # Reload options before every interval so changing App options only requires restart for immediate effect,
-    # but future intervals still honor the persisted value.
     while True:
         settings = load_settings()
         await asyncio.sleep(settings.check_interval_hours * 3600)
@@ -52,12 +50,11 @@ async def lifespan(app: FastAPI):
             startup_task.cancel()
 
 
-app = FastAPI(title="Ofertas Locales", version="0.1.3", lifespan=lifespan)
+app = FastAPI(title="Ofertas Locales", version="0.2.0", lifespan=lifespan)
 
 
 @app.middleware("http")
 async def ingress_only(request: Request, call_next):
-    # Home Assistant Ingress proxy is 172.30.32.2. Loopback is allowed for local smoke tests.
     host = request.client.host if request.client else ""
     if host not in {"172.30.32.2", "127.0.0.1", "::1"}:
         return JSONResponse(status_code=403, content={"detail": "Ingress only"})
@@ -84,6 +81,7 @@ async def status():
             "vision_model": settings.vision_model,
             "image_mode": settings.image_mode,
             "almacor_url": settings.almacor_url,
+            "caracol_home_url": settings.caracol_home_url,
             "heyzine_url": settings.heyzine_url,
             "api_key_configured": bool(settings.vision_api_key),
             "llm_delay_seconds": settings.llm_delay_seconds,
@@ -97,8 +95,7 @@ async def status():
 async def test_vision():
     settings = load_settings()
     try:
-        result = await test_vision_api(settings)
-        return result
+        return await test_vision_api(settings)
     except Exception as exc:
         LOGGER.exception("Falló la prueba de API LLM")
         return {"ok": False, "error": str(exc)}
@@ -112,6 +109,11 @@ async def scan(force: bool = Query(False)):
 @app.get("/api/offers")
 async def offers(source: str | None = None, q: str | None = None, limit: int = Query(300, ge=1, le=1000)):
     return {"items": db.list_offers(source=source, query=q, limit=limit)}
+
+
+@app.get("/api/compare")
+async def compare(q: str | None = None, limit: int = Query(300, ge=1, le=1000)):
+    return {"items": db.compare_current_offers(query=q, limit=limit)}
 
 
 @app.get("/api/catalogs")
