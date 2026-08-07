@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -41,6 +42,13 @@ Respondé exactamente con este objeto:
 confidence debe estar entre 0 y 1. Omití elementos decorativos que no sean productos ofertados.
 """
 
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# A valid 1x1 PNG. Used only by the API test so no catalog needs to exist first.
+TEST_IMAGE_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zz0sAAAAASUVORK5CYII="
+)
+
 
 def _extract_json(text: str) -> dict[str, Any]:
     text = text.strip()
@@ -81,13 +89,7 @@ def _vision_endpoint(settings: Settings) -> str:
     return endpoint
 
 
-async def analyze_image(path: Path, page: int, tile: str, settings: Settings) -> dict[str, Any]:
-    if not settings.vision_enabled:
-        return {"catalog_valid_from": None, "catalog_valid_until": None, "products": []}
-    if not settings.vision_api_key:
-        raise RuntimeError("Vision está activado pero vision_api_key está vacío.")
-
-    endpoint = _vision_endpoint(settings)
+def _headers(settings: Settings) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {settings.vision_api_key}",
         "Content-Type": "application/json",
@@ -95,7 +97,130 @@ async def analyze_image(path: Path, page: int, tile: str, settings: Settings) ->
     if "openrouter.ai" in str(settings.vision_api_base):
         headers["HTTP-Referer"] = "https://www.home-assistant.io/"
         headers["X-Title"] = "Home Assistant - Ofertas Locales"
+    return headers
 
+
+def _retry_after_seconds(response: httpx.Response, fallback: float) -> float:
+    value = response.headers.get("Retry-After")
+    if value:
+        try:
+            return max(0.0, min(float(value), 300.0))
+        except ValueError:
+            pass
+    return fallback
+
+
+async def _post_with_retries(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    settings: Settings,
+) -> httpx.Response:
+    current_payload = payload
+    max_retries = settings.llm_max_retries
+
+    for attempt in range(max_retries + 1):
+        response = await client.post(endpoint, headers=headers, json=current_payload)
+
+        # Some OpenAI-compatible endpoints accept vision but not response_format.
+        # Retry immediately once without it; this is a compatibility fallback, not a quota retry.
+        if response.status_code == 400 and "response_format" in response.text.lower() and "response_format" in current_payload:
+            current_payload = dict(current_payload)
+            current_payload.pop("response_format", None)
+            response = await client.post(endpoint, headers=headers, json=current_payload)
+
+        if response.status_code not in RETRYABLE_STATUS or attempt >= max_retries:
+            return response
+
+        fallback = settings.llm_retry_backoff_seconds * (2 ** attempt)
+        wait_seconds = _retry_after_seconds(response, fallback)
+        LOGGER.warning(
+            "LLM API HTTP %s; reintento %s/%s en %.1f s",
+            response.status_code,
+            attempt + 1,
+            max_retries,
+            wait_seconds,
+        )
+        await asyncio.sleep(wait_seconds)
+
+    return response
+
+
+def _response_content(data: dict[str, Any]) -> str:
+    try:
+        content = data["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return str(content)
+    except Exception as exc:
+        raise RuntimeError(f"Respuesta Vision inesperada: {str(data)[:1000]}") from exc
+
+
+def _raise_api_error(response: httpx.Response, endpoint: str) -> None:
+    if response.status_code < 400:
+        return
+    body = response.text[:1000]
+    hint = ""
+    if response.status_code == 404 and "generativelanguage.googleapis.com" in endpoint:
+        hint = (
+            " Verificá vision_model y que tu clave pertenezca a Gemini API/Google AI Studio. "
+            "Endpoint usado: " + endpoint
+        )
+    raise RuntimeError(f"Vision API devolvió HTTP {response.status_code}: {body}{hint}")
+
+
+async def test_vision_api(settings: Settings) -> dict[str, Any]:
+    """Make a tiny multimodal request to validate endpoint, key, model and image input."""
+    if not settings.vision_api_key:
+        raise RuntimeError("vision_api_key está vacío.")
+
+    endpoint = _vision_endpoint(settings)
+    payload = {
+        "model": settings.vision_model,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Prueba de conectividad Vision. Respondé sólo JSON: {\"ok\": true}",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": TEST_IMAGE_DATA_URI},
+                    },
+                ],
+            }
+        ],
+    }
+
+    LOGGER.info("LLM API test -> %s | model=%s", endpoint, settings.vision_model)
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await _post_with_retries(client, endpoint, _headers(settings), payload, settings)
+        _raise_api_error(response, endpoint)
+        data = response.json()
+
+    content = _response_content(data)
+    return {
+        "ok": True,
+        "endpoint": endpoint,
+        "model": settings.vision_model,
+        "response": content[:300],
+    }
+
+
+async def analyze_image(path: Path, page: int, tile: str, settings: Settings) -> dict[str, Any]:
+    if not settings.vision_enabled:
+        return {"catalog_valid_from": None, "catalog_valid_until": None, "products": []}
+    if not settings.vision_api_key:
+        raise RuntimeError("Vision está activado pero vision_api_key está vacío.")
+
+    endpoint = _vision_endpoint(settings)
     user_text = (
         f"Página {page}, recorte {tile}. Extraé todos los productos y ofertas visibles. "
         f"Año actual de referencia: {datetime.now().year}. Si la vigencia muestra sólo día/mes y es "
@@ -120,29 +245,11 @@ async def analyze_image(path: Path, page: int, tile: str, settings: Settings) ->
     LOGGER.info("Vision request -> %s | model=%s | page=%s | tile=%s", endpoint, settings.vision_model, page, tile)
 
     async with httpx.AsyncClient(timeout=120) as client:
-        response = await client.post(endpoint, headers=headers, json=payload)
-        if response.status_code == 400 and "response_format" in response.text.lower():
-            fallback = dict(payload)
-            fallback.pop("response_format", None)
-            response = await client.post(endpoint, headers=headers, json=fallback)
-        if response.status_code >= 400:
-            body = response.text[:1000]
-            hint = ""
-            if response.status_code == 404 and "generativelanguage.googleapis.com" in endpoint:
-                hint = (
-                    " Verificá vision_model y que tu clave pertenezca a Gemini API/Google AI Studio. "
-                    "Endpoint usado: " + endpoint
-                )
-            raise RuntimeError(f"Vision API devolvió HTTP {response.status_code}: {body}{hint}")
+        response = await _post_with_retries(client, endpoint, _headers(settings), payload, settings)
+        _raise_api_error(response, endpoint)
         data = response.json()
 
-    try:
-        content = data["choices"][0]["message"]["content"]
-        if isinstance(content, list):
-            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-    except Exception as exc:
-        raise RuntimeError(f"Respuesta Vision inesperada: {str(data)[:1000]}") from exc
-    parsed = _extract_json(content)
+    parsed = _extract_json(_response_content(data))
     products = parsed.get("products") or []
     for item in products:
         item["page"] = page
