@@ -121,10 +121,14 @@ class ScanManager:
             all_products: list[dict[str, Any]] = []
             valid_from = None
             valid_until = None
+            provider_usage = {"primary": 0, "backup": 0}
             for image in rendered:
                 parsed = await analyze_image(image.path, image.page, image.tile, settings)
                 valid_from = valid_from or parsed.get("catalog_valid_from")
                 valid_until = valid_until or parsed.get("catalog_valid_until")
+                provider = parsed.get("provider_used")
+                if provider in provider_usage:
+                    provider_usage[provider] += 1
                 all_products.extend(parsed.get("products") or [])
 
             all_products = deduplicate_products(all_products)
@@ -138,6 +142,7 @@ class ScanManager:
                 source_url=catalog.source_url,
                 source=catalog.source,
             )
+            history_updated = db.refresh_history_metrics(catalog.source)
             if settings.notify_event:
                 await fire_catalog_event({
                     "source": catalog.source,
@@ -145,6 +150,7 @@ class ScanManager:
                     "offers": count,
                     "valid_from": valid_from,
                     "valid_until": valid_until,
+                    "provider_usage": provider_usage,
                 })
             return {
                 "source": name,
@@ -155,6 +161,8 @@ class ScanManager:
                 "valid_from": valid_from,
                 "valid_until": valid_until,
                 "source_url": catalog.source_url,
+                "provider_usage": provider_usage,
+                "history_metrics_updated": history_updated,
             }
         except Exception as exc:
             db.update_catalog(catalog_id, status="error", error=str(exc))
