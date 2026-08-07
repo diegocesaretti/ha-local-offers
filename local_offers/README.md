@@ -1,11 +1,11 @@
 # Ofertas Locales — Home Assistant App
 
-App experimental para Home Assistant OS/Supervised que descarga catálogos de supermercados, detecta cambios por SHA-256, renderiza PDFs y usa un modelo multimodal compatible con OpenAI Chat Completions para extraer ofertas.
+App experimental para Home Assistant OS/Supervised que descarga catálogos de supermercados, detecta cambios por SHA-256, renderiza PDFs y usa un modelo multimodal para extraer ofertas.
 
-## Fuentes incluidas
+## Fuentes
 
-- **Almacor**: `https://almacor.com.ar/catalogo/mailing.pdf` (URL fija; se detecta cuando reemplazan el PDF).
-- **Heyzine**: un flipbook configurable. La App lee `flipbookcfg`, obtiene el nombre del PDF original y prueba las rutas CDN de Heyzine.
+- **Almacor**: `https://almacor.com.ar/catalogo/mailing.pdf`.
+- **Supermercados Caracol**: la App consulta `https://www.supercaracol.com.ar/`, detecta automáticamente el Heyzine vigente y descarga su PDF original. `heyzine_url` queda sólo como fallback manual opcional.
 
 ## Funciones
 
@@ -16,10 +16,13 @@ App experimental para Home Assistant OS/Supervised que descarga catálogos de su
 - pausa configurable entre llamadas LLM
 - lock global: nunca dispara dos llamadas LLM en paralelo
 - reintentos para 429/5xx con `Retry-After` o backoff exponencial
-- OpenAI / OpenRouter / endpoints compatibles vía `vision_api_base`
 - SQLite persistente en `/data/offers.db`
 - interfaz web por Home Assistant Ingress
 - `sensor.local_offers` con resumen
 - evento `local_offers_catalog_updated`
+- comparación de precios Almacor ↔ Caracol
+- normalización conservadora de producto/presentación (litros/ml/cc, kg/g)
+- diferencia en pesos y porcentaje, con indicación del supermercado más barato
+- clasificación de alimentos y marcador **SIN TACC** sólo con evidencia visual explícita
 
-> El enlace de Heyzine debe actualizarse cuando el comercio publique un flipbook con un ID nuevo. La detección automática del nuevo post/enlace queda para una siguiente etapa.
+> Tras actualizar desde una versión 0.1.x conviene ejecutar una vez **Reanalizar** para que los catálogos actuales incorporen `is_food` y `sin_tacc`.
