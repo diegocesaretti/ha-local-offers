@@ -68,7 +68,14 @@ def _vision_endpoint(settings: Settings) -> str:
         raise RuntimeError("vision_api_base está vacío.")
     if not re.match(r"^https?://", base, flags=re.I):
         base = "https://" + base
-    endpoint = base.rstrip("/") + "/chat/completions"
+
+    # Gemini OpenAI compatibility: accept either the base URL or the full
+    # /chat/completions URL and always normalize to Google's canonical endpoint.
+    if "generativelanguage.googleapis.com" in base.lower():
+        return "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+
+    base = re.sub(r"/chat/completions/?$", "", base, flags=re.I).rstrip("/")
+    endpoint = base + "/chat/completions"
     if not re.match(r"^https?://", endpoint, flags=re.I):
         raise RuntimeError(f"vision_api_base inválido: {settings.vision_api_base!r}")
     return endpoint
@@ -85,8 +92,7 @@ async def analyze_image(path: Path, page: int, tile: str, settings: Settings) ->
         "Authorization": f"Bearer {settings.vision_api_key}",
         "Content-Type": "application/json",
     }
-    # OpenRouter benefits from these optional attribution headers, OpenAI ignores them if absent.
-    if "openrouter.ai" in settings.vision_api_base:
+    if "openrouter.ai" in str(settings.vision_api_base):
         headers["HTTP-Referer"] = "https://www.home-assistant.io/"
         headers["X-Title"] = "Home Assistant - Ofertas Locales"
 
@@ -115,15 +121,19 @@ async def analyze_image(path: Path, page: int, tile: str, settings: Settings) ->
 
     async with httpx.AsyncClient(timeout=120) as client:
         response = await client.post(endpoint, headers=headers, json=payload)
-        # Some OpenAI-compatible models/endpoints accept vision but not response_format.
-        # Retry once without it instead of failing the whole catalog.
         if response.status_code == 400 and "response_format" in response.text.lower():
             fallback = dict(payload)
             fallback.pop("response_format", None)
             response = await client.post(endpoint, headers=headers, json=fallback)
         if response.status_code >= 400:
             body = response.text[:1000]
-            raise RuntimeError(f"Vision API devolvió HTTP {response.status_code}: {body}")
+            hint = ""
+            if response.status_code == 404 and "generativelanguage.googleapis.com" in endpoint:
+                hint = (
+                    " Verificá vision_model y que tu clave pertenezca a Gemini API/Google AI Studio. "
+                    "Endpoint usado: " + endpoint
+                )
+            raise RuntimeError(f"Vision API devolvió HTTP {response.status_code}: {body}{hint}")
         data = response.json()
 
     try:
