@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from . import db
 from .config import load_settings
 from .processor import ScanManager
+from .vision import test_vision_api
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,7 +52,7 @@ async def lifespan(app: FastAPI):
             startup_task.cancel()
 
 
-app = FastAPI(title="Ofertas Locales", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Ofertas Locales", version="0.1.3", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -79,13 +80,28 @@ async def status():
         "config": {
             "check_interval_hours": settings.check_interval_hours,
             "vision_enabled": settings.vision_enabled,
+            "vision_api_base": settings.vision_api_base,
             "vision_model": settings.vision_model,
             "image_mode": settings.image_mode,
             "almacor_url": settings.almacor_url,
             "heyzine_url": settings.heyzine_url,
             "api_key_configured": bool(settings.vision_api_key),
+            "llm_delay_seconds": settings.llm_delay_seconds,
+            "llm_max_retries": settings.llm_max_retries,
+            "llm_retry_backoff_seconds": settings.llm_retry_backoff_seconds,
         },
     }
+
+
+@app.post("/api/test-vision")
+async def test_vision():
+    settings = load_settings()
+    try:
+        result = await test_vision_api(settings)
+        return result
+    except Exception as exc:
+        LOGGER.exception("Falló la prueba de API LLM")
+        return {"ok": False, "error": str(exc)}
 
 
 @app.post("/api/scan")
