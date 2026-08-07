@@ -1,0 +1,27 @@
+configuration:
+  check_interval_hours:
+    name: Check interval (hours)
+  scan_on_start:
+    name: Scan on start
+  almacor_url:
+    name: Almacor catalog URL
+  heyzine_url:
+    name: Heyzine flipbook URL
+  vision_enabled:
+    name: Enable LLM Vision
+  vision_api_base:
+    name: Vision API base URL
+  vision_api_key:
+    name: Vision API key
+  vision_model:
+    name: Vision model
+  image_mode:
+    name: Image mode
+  render_dpi:
+    name: Render DPI
+  jpeg_quality:
+    name: JPEG quality
+  max_pages:
+    name: Maximum pages
+  notify_event:
+    name: Fire Home Assistant event
