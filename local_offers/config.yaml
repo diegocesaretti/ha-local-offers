@@ -38,7 +38,7 @@ schema:
   scan_on_start: bool
   almacor_url: url
   caracol_home_url: url
-  heyzine_url: str?
+  heyzine_url: str
   vision_enabled: bool
   vision_api_base: str
   vision_api_key: password
