@@ -106,8 +106,14 @@ class ScanManager:
             all_products: list[dict[str, Any]] = []
             valid_from = None
             valid_until = None
+
             # Sequential by design: avoids API bursts and keeps memory usage modest on a Pi.
-            for image in rendered:
+            # A configurable pause is added between images/tiles to further protect API quotas.
+            for idx, image in enumerate(rendered):
+                if idx > 0 and settings.llm_delay_seconds > 0:
+                    LOGGER.info("Pausa LLM de %s s antes de la siguiente imagen", settings.llm_delay_seconds)
+                    await asyncio.sleep(settings.llm_delay_seconds)
+
                 parsed = await analyze_image(image.path, image.page, image.tile, settings)
                 valid_from = valid_from or parsed.get("catalog_valid_from")
                 valid_until = valid_until or parsed.get("catalog_valid_until")
