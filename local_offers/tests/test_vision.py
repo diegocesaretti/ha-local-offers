@@ -1,5 +1,10 @@
 from app.config import Settings
-from app.vision import _extract_json, _vision_endpoint, deduplicate_products
+from app.vision import (
+    _extract_json,
+    _retry_fallback_seconds,
+    _vision_endpoint,
+    deduplicate_products,
+)
 
 
 def test_extract_json_fenced():
@@ -29,3 +34,13 @@ def test_default_settings_are_gemini_weekly_and_paced():
     assert settings.llm_delay_seconds == 2
     assert settings.llm_max_retries == 3
     assert settings.llm_retry_backoff_seconds == 5
+    assert settings.vision_backup_enabled is False
+    assert settings.vision_backup_api_base == "https://openrouter.ai/api/v1"
+
+
+def test_third_retry_waits_60_seconds():
+    base = 5
+    assert _retry_fallback_seconds(0, base) == 5
+    assert _retry_fallback_seconds(1, base) == 10
+    assert _retry_fallback_seconds(2, base) == 60
+    assert _retry_fallback_seconds(3, base) == 120
