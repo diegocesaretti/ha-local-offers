@@ -12,11 +12,19 @@ configuration:
   vision_enabled:
     name: Enable LLM Vision
   vision_api_base:
-    name: Vision API base URL
+    name: Primary LLM API base URL
   vision_api_key:
-    name: Vision API key
+    name: Primary LLM API key
   vision_model:
-    name: Vision model
+    name: Primary LLM model
+  vision_backup_enabled:
+    name: Enable backup LLM
+  vision_backup_api_base:
+    name: Backup LLM API base URL
+  vision_backup_api_key:
+    name: Backup LLM API key
+  vision_backup_model:
+    name: Backup LLM model
   image_mode:
     name: Image mode
   render_dpi:
