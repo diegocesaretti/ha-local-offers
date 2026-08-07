@@ -61,6 +61,10 @@ class ScanManager:
                            settings: Settings, force: bool) -> dict[str, Any]:
         catalog = await fetcher()
         existing = db.catalog_by_hash(catalog.sha256)
+        tacc_state = (
+            db.get_state(self._tacc_complete_key(int(existing["id"])))
+            if existing else None
+        )
         needs_processing = bool(
             existing
             and settings.vision_enabled
@@ -70,7 +74,7 @@ class ScanManager:
             existing
             and existing.get("status") == "ready"
             and settings.vision_enabled
-            and db.get_state(self._tacc_complete_key(int(existing["id"]))) != "1"
+            and tacc_state != "1"
         )
 
         if existing and not force and not needs_processing:
@@ -78,7 +82,10 @@ class ScanManager:
                 catalog_id = int(existing["id"])
                 mode = self._stored_image_mode(catalog_id, settings.image_mode)
                 rendered = self._render(catalog, settings, mode)
-                tacc = await self._verify_sin_tacc(catalog_id, rendered, settings, reset=False)
+                # No v0.3 state means these may be legacy v0.2 SIN TACC values: clear once.
+                tacc = await self._verify_sin_tacc(
+                    catalog_id, rendered, settings, reset=(tacc_state is None)
+                )
                 return {
                     "source": name,
                     "ok": True,
@@ -177,7 +184,7 @@ class ScanManager:
                 source=catalog.source,
             )
 
-            # Prices/products are now safely in SQLite. SIN TACC is intentionally a second pass.
+            # Products/prices are safely in SQLite before gluten verification begins.
             self._clear_tacc_state(catalog_id)
             tacc = await self._verify_sin_tacc(catalog_id, rendered, settings, reset=False)
             history_updated = db.refresh_history_metrics(catalog.source)
@@ -321,7 +328,7 @@ class ScanManager:
                 message = f"p{image.page}/{image.tile}: {exc}"
                 errors.append(message)
                 LOGGER.warning("SIN TACC pendiente %s catálogo %s: %s", image.tile, catalog_id, exc)
-                # Do not fail the catalog: products/prices are already safely stored.
+                # Product/price extraction remains valid; this chunk will retry later.
 
         complete = not errors
         db.set_state(self._tacc_complete_key(catalog_id), "1" if complete else "0")
