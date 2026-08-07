@@ -1,0 +1,27 @@
+configuration:
+  check_interval_hours:
+    name: Intervalo de chequeo (horas)
+  scan_on_start:
+    name: Escanear al iniciar
+  almacor_url:
+    name: URL del catálogo de Almacor
+  heyzine_url:
+    name: URL del flipbook de Heyzine
+  vision_enabled:
+    name: Activar LLM Vision
+  vision_api_base:
+    name: URL base de la API Vision
+  vision_api_key:
+    name: Clave de API Vision
+  vision_model:
+    name: Modelo Vision
+  image_mode:
+    name: Modo de imagen
+  render_dpi:
+    name: DPI de renderizado
+  jpeg_quality:
+    name: Calidad JPEG
+  max_pages:
+    name: Máximo de páginas
+  notify_event:
+    name: Disparar evento en Home Assistant
