@@ -13,7 +13,9 @@ class Settings(BaseModel):
     check_interval_hours: int = Field(default=168, ge=1, le=168)
     scan_on_start: bool = False
     almacor_url: str = "https://almacor.com.ar/catalogo/mailing.pdf"
-    heyzine_url: str = "https://heyzine.com/flip-book/fafe2791cf.html"
+    caracol_home_url: str = "https://www.supercaracol.com.ar/"
+    # Backward-compatible/manual fallback. Automatic discovery from caracol_home_url is preferred.
+    heyzine_url: str = ""
     vision_enabled: bool = False
     vision_api_base: str = "https://generativelanguage.googleapis.com/v1beta/openai"
     vision_api_key: str = ""
@@ -22,9 +24,9 @@ class Settings(BaseModel):
     render_dpi: int = Field(default=170, ge=100, le=240)
     jpeg_quality: int = Field(default=88, ge=60, le=95)
     max_pages: int = Field(default=40, ge=1, le=100)
-    llm_delay_seconds: int = Field(default=2, ge=0, le=120)
+    llm_delay_seconds: float = Field(default=2.0, ge=0, le=120)
     llm_max_retries: int = Field(default=3, ge=0, le=10)
-    llm_retry_backoff_seconds: int = Field(default=5, ge=1, le=120)
+    llm_retry_backoff_seconds: float = Field(default=5.0, ge=1, le=120)
     notify_event: bool = True
 
     @field_validator("vision_api_base", mode="before")
