@@ -16,25 +16,35 @@ class Settings(BaseModel):
     caracol_home_url: str = "https://www.supercaracol.com.ar/"
     # Backward-compatible/manual fallback. Automatic discovery from caracol_home_url is preferred.
     heyzine_url: str = ""
+
     vision_enabled: bool = False
     vision_api_base: str = "https://generativelanguage.googleapis.com/v1beta/openai"
     vision_api_key: str = ""
     vision_model: str = "gemini-3.6-flash"
+
+    # Optional secondary profile. It is tried only after the primary profile has failed.
+    vision_backup_enabled: bool = False
+    vision_backup_api_base: str = "https://openrouter.ai/api/v1"
+    vision_backup_api_key: str = ""
+    vision_backup_model: str = ""
+
     image_mode: str = "full"
     render_dpi: int = Field(default=170, ge=100, le=240)
     jpeg_quality: int = Field(default=88, ge=60, le=95)
     max_pages: int = Field(default=40, ge=1, le=100)
+
+    # Shared rate-limit/retry policy for primary and backup providers.
     llm_delay_seconds: float = Field(default=2.0, ge=0, le=120)
     llm_max_retries: int = Field(default=3, ge=0, le=10)
     llm_retry_backoff_seconds: float = Field(default=5.0, ge=1, le=120)
     notify_event: bool = True
 
-    @field_validator("vision_api_base", mode="before")
+    @field_validator("vision_api_base", "vision_backup_api_base", mode="before")
     @classmethod
     def normalize_vision_api_base(cls, value):
         value = str(value or "").strip().strip('"').strip("'")
         if not value:
-            return "https://generativelanguage.googleapis.com/v1beta/openai"
+            return ""
         if not re.match(r"^https?://", value, flags=re.I):
             value = "https://" + value
         return value.rstrip("/")
