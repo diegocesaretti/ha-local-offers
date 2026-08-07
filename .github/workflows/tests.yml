@@ -25,4 +25,6 @@ jobs:
         run: python -m compileall -q app tests
       - name: Test
         working-directory: local_offers
+        env:
+          PYTHONPATH: .
         run: pytest -q
