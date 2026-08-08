@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from . import checkpoints, db
+from .anmat import match_products_anmat
 from .config import Settings, load_settings
 from .gluten import classify_gluten_text
 from .ha import fire_catalog_event, publish_summary
@@ -32,6 +34,7 @@ class ScanManager:
             self.running = True
             try:
                 settings = load_settings()
+                self._ensure_gluten_columns()
                 results = []
                 jobs: list[tuple[str, Callable[[], Awaitable[DownloadedCatalog]]]] = [
                     ("Almacor", lambda: fetch_almacor(settings.almacor_url, CATALOG_ROOT)),
@@ -86,7 +89,6 @@ class ScanManager:
         if existing and not force and not needs_processing:
             if pending_gluten:
                 catalog_id = int(existing["id"])
-                # No text-classifier state means values may come from the old visual verifier.
                 gluten = await self._classify_gluten(
                     catalog_id,
                     settings,
@@ -192,7 +194,7 @@ class ScanManager:
                 source=catalog.source,
             )
 
-            # Products/prices are safely in SQLite before text-only gluten classification.
+            # Products/prices are safely in SQLite before gluten classification begins.
             self._clear_gluten_state(catalog_id)
             gluten = await self._classify_gluten(catalog_id, settings, reset=False)
             history_updated = db.refresh_history_metrics(catalog.source)
@@ -258,7 +260,21 @@ class ScanManager:
     def _gluten_offer_key(catalog_id: int, offer_id: int) -> str:
         return f"gluten_text_offer:{catalog_id}:{offer_id}"
 
+    @staticmethod
+    def _ensure_gluten_columns() -> None:
+        with db.connect() as conn:
+            names = {row[1] for row in conn.execute("PRAGMA table_info(offers)").fetchall()}
+            additions = {
+                "gluten_source": "TEXT",
+                "gluten_confidence": "REAL",
+                "gluten_detail": "TEXT",
+            }
+            for name, definition in additions.items():
+                if name not in names:
+                    conn.execute(f"ALTER TABLE offers ADD COLUMN {name} {definition}")
+
     def _clear_gluten_state(self, catalog_id: int) -> None:
+        self._ensure_gluten_columns()
         with db.connect() as conn:
             conn.execute(
                 "DELETE FROM app_state WHERE key=? OR key LIKE ? OR key LIKE ?",
@@ -272,9 +288,14 @@ class ScanManager:
                 "DELETE FROM app_state WHERE key=?",
                 (f"sin_tacc_complete:{catalog_id}",),
             )
-            conn.execute("UPDATE offers SET sin_tacc=NULL WHERE catalog_id=?", (catalog_id,))
+            conn.execute(
+                "UPDATE offers SET sin_tacc=NULL, gluten_source=NULL, gluten_confidence=NULL, gluten_detail=NULL "
+                "WHERE catalog_id=?",
+                (catalog_id,),
+            )
 
     def _pending_food_offers(self, catalog_id: int) -> tuple[list[dict[str, Any]], int]:
+        self._ensure_gluten_columns()
         with db.connect() as conn:
             rows = [
                 dict(row)
@@ -293,6 +314,40 @@ class ScanManager:
                 pending.append(item)
         return pending, reused
 
+    def _save_gluten_result(
+        self,
+        catalog_id: int,
+        offer_id: int,
+        status: str,
+        source: str,
+        confidence: float | None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        if status == "sin_gluten":
+            db_value = 1
+        elif status == "con_tacc":
+            db_value = 0
+        else:
+            db_value = None
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE offers SET sin_tacc=?, gluten_source=?, gluten_confidence=?, gluten_detail=? "
+                "WHERE id=? AND catalog_id=?",
+                (
+                    db_value,
+                    source,
+                    confidence,
+                    json.dumps(detail or {}, ensure_ascii=False),
+                    offer_id,
+                    catalog_id,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO app_state(key,value) VALUES(?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'",
+                (self._gluten_offer_key(catalog_id, offer_id),),
+            )
+
     async def _classify_gluten(
         self,
         catalog_id: int,
@@ -309,6 +364,7 @@ class ScanManager:
                 "complete": True,
                 "products_checked": 0,
                 "checkpoint_reused": reused_products,
+                "anmat_matches": 0,
                 "batches_processed": 0,
                 "provider_usage": {"primary": 0, "backup": 0},
                 "errors": [],
@@ -319,6 +375,23 @@ class ScanManager:
         provider_usage = {"primary": 0, "backup": 0}
         errors: list[str] = []
 
+        # 1) Official best-effort lookup: only strong, unambiguous LIALG Vigente matches become green ANMAT.
+        anmat = await match_products_anmat(pending, settings)
+        for oid, match in (anmat.get("matches") or {}).items():
+            self._save_gluten_result(
+                catalog_id,
+                int(oid),
+                "sin_gluten",
+                "ANMAT",
+                float(match.get("score") or 0.0),
+                match,
+            )
+            products_checked += 1
+
+        errors.extend(f"ANMAT: {x}" for x in (anmat.get("errors") or []))
+
+        # 2) Everything ANMAT could not resolve is classified from the already-scraped product text.
+        pending, _ = self._pending_food_offers(catalog_id)
         for offset in range(0, len(pending), GLUTEN_BATCH_SIZE):
             batch = pending[offset:offset + GLUTEN_BATCH_SIZE]
             try:
@@ -327,42 +400,37 @@ class ScanManager:
                 if provider in provider_usage:
                     provider_usage[provider] += 1
 
-                rows = result.get("results") or []
-                with db.connect() as conn:
-                    for row in rows:
-                        status = row.get("status")
-                        if status == "sin_gluten":
-                            db_value = 1
-                        elif status == "con_tacc":
-                            db_value = 0
-                        else:
-                            db_value = None
-                        oid = int(row["id"])
-                        conn.execute(
-                            "UPDATE offers SET sin_tacc=? WHERE id=? AND catalog_id=?",
-                            (db_value, oid, catalog_id),
-                        )
-                        conn.execute(
-                            "INSERT INTO app_state(key,value) VALUES(?, '1') "
-                            "ON CONFLICT(key) DO UPDATE SET value='1'",
-                            (self._gluten_offer_key(catalog_id, oid),),
-                        )
-                        products_checked += 1
+                for row in result.get("results") or []:
+                    self._save_gluten_result(
+                        catalog_id,
+                        int(row["id"]),
+                        str(row.get("status") or "indeterminado"),
+                        "LLM",
+                        float(row.get("confidence") or 0.0),
+                        {
+                            "provider": provider,
+                            "model": result.get("provider_model"),
+                        },
+                    )
+                    products_checked += 1
                 batches_processed += 1
             except Exception as exc:
-                message = f"lote {offset // GLUTEN_BATCH_SIZE + 1}: {exc}"
+                message = f"LLM lote {offset // GLUTEN_BATCH_SIZE + 1}: {exc}"
                 errors.append(message)
                 LOGGER.warning("Clasificación gluten pendiente catálogo %s: %s", catalog_id, exc)
-                # Stop here: processed products remain checkpointed and the next scan resumes.
+                # Stop here: products already classified by ANMAT/LLM remain checkpointed.
                 break
 
         remaining, total_reused = self._pending_food_offers(catalog_id)
-        complete = not remaining and not errors
+        complete = not remaining
         db.set_state(self._gluten_complete_key(catalog_id), "1" if complete else "0")
         return {
             "complete": complete,
             "products_checked": products_checked,
             "checkpoint_reused": total_reused,
+            "anmat_matches": len(anmat.get("matches") or {}),
+            "anmat_brands": anmat.get("brands", 0),
+            "anmat_queries": anmat.get("queries", 0),
             "batches_processed": batches_processed,
             "batch_size": GLUTEN_BATCH_SIZE,
             "remaining": len(remaining),
