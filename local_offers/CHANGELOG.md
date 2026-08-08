@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1
+
+- La clasificación de gluten deja de reenviar imágenes al LLM: trabaja sobre la lista textual de productos ya guardada en SQLite.
+- Semáforo de alimentos: **Verde = Sin Gluten**, **Amarillo = indeterminado**, **Rojo = Con TACC**.
+- Integración best-effort con el Listado Integrado de Alimentos Libres de Gluten (LIALG) de ANMAT/INAL.
+- Los matches fuertes, no ambiguos y con estado `Vigente` se marcan como **Sin Gluten · ANMAT**.
+- Los productos que ANMAT no resuelve pasan al clasificador LLM textual en lotes de hasta 50.
+- Cada estado guarda fuente (`ANMAT`/`LLM`), confianza y detalle técnico.
+- Checkpoint por producto: una interrupción continúa sólo con los alimentos todavía no clasificados.
+- Búsquedas ANMAT agrupadas por marca, cacheadas 7 días y con pausa configurable para no sobrecargar el sitio público.
+- Un fallo/cambio de HTML de ANMAT no bloquea el catálogo: se usa el fallback LLM textual.
+
 ## 0.3.0
 
 - Segundo perfil LLM Vision opcional de respaldo con failover automático.
@@ -13,8 +25,7 @@
 - Clasificación de oportunidades: nuevo mínimo, mínimo histórico, muy buena, buena, normal, sobre promedio y sin historial.
 - Nueva vista **Histórico / oportunidades** y detalle de observaciones anteriores.
 - La comparación Almacor ↔ Caracol incorpora contexto histórico de cada precio.
-- SIN TACC pasa a una segunda etapa: primero se arma la base de productos/precios; después se verifica evidencia visual sólo para alimentos ya guardados.
-- La verificación SIN TACC tiene checkpoints propios y sus fallas no invalidan los precios ya extraídos.
+- SIN TACC pasó inicialmente a una segunda etapa separada de la extracción de precios; en 0.3.1 esa etapa fue reemplazada por clasificación textual + ANMAT.
 
 ## 0.2.0
 
@@ -25,9 +36,7 @@
 - Nuevo modo **Comparar precios** entre Almacor y Caracol.
 - Matching conservador por marca, nombre y presentación; normaliza unidades como litros/ml/cc y kg/g.
 - La comparación muestra diferencia en pesos, porcentaje y supermercado más barato.
-- Gemini clasifica `is_food` y detecta evidencia visual `sin_tacc`.
-- `sin_tacc=true` sólo se acepta si el folleto muestra explícitamente logo/texto SIN TACC o declaración inequívoca de libre de gluten; sin evidencia queda como no verificado.
-- La Web UI suma filtros de alimentos y SIN TACC verificado.
+- Gemini clasifica `is_food`.
 
 ## 0.1.3
 
