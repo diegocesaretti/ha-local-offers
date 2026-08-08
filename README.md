@@ -4,7 +4,7 @@ Home Assistant App para detectar catálogos de supermercados locales, descargar 
 
 ## Estado
 
-Versión actual: `v0.3.0`.
+Versión actual: `v0.3.1`.
 
 Fuentes actuales:
 
@@ -14,23 +14,22 @@ Fuentes actuales:
 ## Funciones principales
 
 - Gemini (`gemini-3.6-flash`) como perfil Vision principal predeterminado.
-- Segundo perfil LLM Vision opcional de respaldo con failover automático.
+- Segundo perfil LLM opcional de respaldo con failover automático.
 - Métricas de éxito/falla/failover por proveedor.
 - Scraping semanal por defecto.
 - Detección de cambios por SHA-256.
 - Checkpoints persistentes por página/recorte para reanudar escaneos interrumpidos.
 - Reintentos LLM 5 s → 10 s → 60 s por defecto, respetando `Retry-After` si es mayor.
-- Botón para probar ambos perfiles LLM.
-- Rate limiting global: nunca salen requests Vision simultáneas.
 - Comparación de precios Almacor ↔ Caracol por producto/presentación equivalente.
 - Histórico por producto: mínimo anterior, promedios 30/60/90 días y variación porcentual.
 - Vista **Histórico / oportunidades** para distinguir ofertas reales de precios normales o altos.
-- Clasificación de alimentos/bebidas.
-- Verificación **SIN TACC** en una segunda pasada, únicamente después de guardar la base de productos/precios y sólo cuando existe evidencia visual explícita.
-- Checkpoints independientes para completar SIN TACC sin volver a procesar los precios.
+- Semáforo gluten posterior al scraping: **Verde Sin Gluten / Amarillo indeterminado / Rojo Con TACC**.
+- Integración best-effort con el listado oficial LIALG de ANMAT/INAL; matches Vigentes fuertes se identifican como **Sin Gluten · ANMAT**.
+- Lo no resuelto por ANMAT se clasifica con LLM sobre texto en lotes de hasta 50, sin reenviar imágenes.
+- Checkpoint individual de la clasificación gluten y fuente/confianza visibles en la UI.
 - Enlace al PDF/fuente original para verificar cada oferta.
 
-También permite usar proveedores Vision compatibles con OpenAI Chat Completions como OpenRouter u otros endpoints configurables.
+También permite usar proveedores compatibles con OpenAI Chat Completions como Groq, OpenRouter u otros endpoints configurables.
 
 ## Instalación
 
@@ -38,4 +37,4 @@ Agregá este repositorio como repositorio de Apps/Add-ons de Home Assistant o in
 
 La documentación detallada está en [local_offers/DOCS.md](local_offers/DOCS.md).
 
-> Proyecto experimental. Las promociones complejas y la condición SIN TACC deben verificarse contra el catálogo/envase original antes de tomar decisiones de compra.
+> Proyecto experimental. Para decisiones de consumo vinculadas a celiaquía, verificá siempre el rótulo/envase y la fuente oficial vigente; la clasificación LLM es orientativa.
