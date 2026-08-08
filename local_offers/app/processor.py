@@ -1,21 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
-from .config import Settings, load_settings
 from . import checkpoints, db
+from .config import Settings, load_settings
+from .gluten import classify_gluten_text
 from .ha import fire_catalog_event, publish_summary
 from .render import RenderedImage, render_pdf
 from .sources import DownloadedCatalog, fetch_almacor, fetch_caracol
-from .vision import analyze_image, deduplicate_products, verify_sin_tacc_image
+from .vision import analyze_image, deduplicate_products
 
 LOGGER = logging.getLogger(__name__)
 CATALOG_ROOT = Path("/data/catalogs")
 RENDER_ROOT = Path("/data/rendered")
+GLUTEN_BATCH_SIZE = 50
 
 
 class ScanManager:
@@ -57,12 +58,17 @@ class ScanManager:
             finally:
                 self.running = False
 
-    async def _scan_source(self, name: str, fetcher: Callable[[], Awaitable[DownloadedCatalog]],
-                           settings: Settings, force: bool) -> dict[str, Any]:
+    async def _scan_source(
+        self,
+        name: str,
+        fetcher: Callable[[], Awaitable[DownloadedCatalog]],
+        settings: Settings,
+        force: bool,
+    ) -> dict[str, Any]:
         catalog = await fetcher()
         existing = db.catalog_by_hash(catalog.sha256)
-        tacc_state = (
-            db.get_state(self._tacc_complete_key(int(existing["id"])))
+        gluten_state = (
+            db.get_state(self._gluten_complete_key(int(existing["id"])))
             if existing else None
         )
         needs_processing = bool(
@@ -70,30 +76,30 @@ class ScanManager:
             and settings.vision_enabled
             and existing.get("status") != "ready"
         )
-        pending_sin_tacc = bool(
+        pending_gluten = bool(
             existing
             and existing.get("status") == "ready"
             and settings.vision_enabled
-            and tacc_state != "1"
+            and gluten_state != "1"
         )
 
         if existing and not force and not needs_processing:
-            if pending_sin_tacc:
+            if pending_gluten:
                 catalog_id = int(existing["id"])
-                mode = self._stored_image_mode(catalog_id, settings.image_mode)
-                rendered = self._render(catalog, settings, mode)
-                # No v0.3 state means these may be legacy v0.2 SIN TACC values: clear once.
-                tacc = await self._verify_sin_tacc(
-                    catalog_id, rendered, settings, reset=(tacc_state is None)
+                # No text-classifier state means values may come from the old visual verifier.
+                gluten = await self._classify_gluten(
+                    catalog_id,
+                    settings,
+                    reset=(gluten_state is None),
                 )
                 return {
                     "source": name,
                     "ok": True,
                     "changed": False,
                     "catalog_id": catalog_id,
-                    "message": "Catálogo sin cambios; se continuó la verificación SIN TACC pendiente.",
+                    "message": "Catálogo sin cambios; se continuó la clasificación gluten pendiente.",
                     "source_url": catalog.source_url,
-                    "sin_tacc": tacc,
+                    "gluten": gluten,
                 }
             return {
                 "source": name,
@@ -128,7 +134,7 @@ class ScanManager:
 
         if force:
             checkpoints.clear_catalog(catalog.sha256)
-            self._clear_tacc_state(catalog_id)
+            self._clear_gluten_state(catalog_id)
 
         if not settings.vision_enabled:
             db.update_catalog(catalog_id, status="downloaded")
@@ -158,7 +164,9 @@ class ScanManager:
                     reused += 1
                     LOGGER.info(
                         "Checkpoint reutilizado %s p%s/%s",
-                        catalog.source, image.page, image.tile,
+                        catalog.source,
+                        image.page,
+                        image.tile,
                     )
                 else:
                     parsed = await analyze_image(image.path, image.page, image.tile, settings)
@@ -184,9 +192,9 @@ class ScanManager:
                 source=catalog.source,
             )
 
-            # Products/prices are safely in SQLite before gluten verification begins.
-            self._clear_tacc_state(catalog_id)
-            tacc = await self._verify_sin_tacc(catalog_id, rendered, settings, reset=False)
+            # Products/prices are safely in SQLite before text-only gluten classification.
+            self._clear_gluten_state(catalog_id)
+            gluten = await self._classify_gluten(catalog_id, settings, reset=False)
             history_updated = db.refresh_history_metrics(catalog.source)
 
             if settings.notify_event:
@@ -198,7 +206,7 @@ class ScanManager:
                     "valid_until": valid_until,
                     "provider_usage": provider_usage,
                     "checkpoint_reused": reused,
-                    "sin_tacc_complete": tacc.get("complete", False),
+                    "gluten_complete": gluten.get("complete", False),
                 })
             return {
                 "source": name,
@@ -214,18 +222,24 @@ class ScanManager:
                 "chunks_processed_now": processed,
                 "chunks_total": len(rendered),
                 "history_metrics_updated": history_updated,
-                "sin_tacc": tacc,
+                "gluten": gluten,
             }
         except Exception as exc:
             db.update_catalog(catalog_id, status="error", error=str(exc))
             saved = checkpoints.count_chunks(catalog.sha256)
             LOGGER.error(
                 "Escaneo interrumpido en %s; %s páginas/recortes quedan checkpointados para continuar.",
-                catalog.source, saved,
+                catalog.source,
+                saved,
             )
             raise
 
-    def _render(self, catalog: DownloadedCatalog, settings: Settings, image_mode: str) -> list[RenderedImage]:
+    def _render(
+        self,
+        catalog: DownloadedCatalog,
+        settings: Settings,
+        image_mode: str,
+    ) -> list[RenderedImage]:
         render_dir = RENDER_ROOT / catalog.source.lower() / catalog.sha256[:12]
         return render_pdf(
             catalog.pdf_path,
@@ -237,106 +251,121 @@ class ScanManager:
         )
 
     @staticmethod
-    def _tacc_complete_key(catalog_id: int) -> str:
-        return f"sin_tacc_complete:{catalog_id}"
+    def _gluten_complete_key(catalog_id: int) -> str:
+        return f"gluten_text_complete:{catalog_id}"
 
     @staticmethod
-    def _tacc_chunk_key(catalog_id: int, page: int, tile: str) -> str:
-        return f"sin_tacc_chunk:{catalog_id}:{int(page)}:{tile}"
+    def _gluten_offer_key(catalog_id: int, offer_id: int) -> str:
+        return f"gluten_text_offer:{catalog_id}:{offer_id}"
 
-    def _clear_tacc_state(self, catalog_id: int) -> None:
+    def _clear_gluten_state(self, catalog_id: int) -> None:
         with db.connect() as conn:
             conn.execute(
-                "DELETE FROM app_state WHERE key=? OR key LIKE ?",
-                (self._tacc_complete_key(catalog_id), f"sin_tacc_chunk:{catalog_id}:%"),
+                "DELETE FROM app_state WHERE key=? OR key LIKE ? OR key LIKE ?",
+                (
+                    self._gluten_complete_key(catalog_id),
+                    f"gluten_text_offer:{catalog_id}:%",
+                    f"sin_tacc_chunk:{catalog_id}:%",
+                ),
+            )
+            conn.execute(
+                "DELETE FROM app_state WHERE key=?",
+                (f"sin_tacc_complete:{catalog_id}",),
             )
             conn.execute("UPDATE offers SET sin_tacc=NULL WHERE catalog_id=?", (catalog_id,))
 
-    def _stored_image_mode(self, catalog_id: int, fallback: str) -> str:
+    def _pending_food_offers(self, catalog_id: int) -> tuple[list[dict[str, Any]], int]:
         with db.connect() as conn:
-            rows = conn.execute(
-                "SELECT raw_json FROM offers WHERE catalog_id=? LIMIT 2000", (catalog_id,)
-            ).fetchall()
-        for row in rows:
-            try:
-                raw = json.loads(row[0] or "{}")
-                if str(raw.get("tile") or "").startswith("q"):
-                    return "quarters"
-            except Exception:
-                continue
-        return fallback if fallback in {"full", "quarters"} else "full"
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM offers WHERE catalog_id=? AND is_food=1 ORDER BY id",
+                    (catalog_id,),
+                ).fetchall()
+            ]
+        pending: list[dict[str, Any]] = []
+        reused = 0
+        for item in rows:
+            key = self._gluten_offer_key(catalog_id, int(item["id"]))
+            if db.get_state(key) == "1":
+                reused += 1
+            else:
+                pending.append(item)
+        return pending, reused
 
-    def _offers_for_image(self, catalog_id: int, page: int, tile: str) -> list[dict[str, Any]]:
-        with db.connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM offers WHERE catalog_id=? AND page=? AND is_food=1 ORDER BY id",
-                (catalog_id, int(page)),
-            ).fetchall()
-        out: list[dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            try:
-                raw = json.loads(item.get("raw_json") or "{}")
-            except Exception:
-                raw = {}
-            stored_tile = str(raw.get("tile") or "full")
-            if stored_tile != str(tile):
-                continue
-            out.append(item)
-        return out
-
-    async def _verify_sin_tacc(self, catalog_id: int, rendered: list[RenderedImage],
-                               settings: Settings, reset: bool = False) -> dict[str, Any]:
+    async def _classify_gluten(
+        self,
+        catalog_id: int,
+        settings: Settings,
+        reset: bool = False,
+    ) -> dict[str, Any]:
         if reset:
-            self._clear_tacc_state(catalog_id)
-        verified_chunks = 0
-        reused_chunks = 0
+            self._clear_gluten_state(catalog_id)
+
+        pending, reused_products = self._pending_food_offers(catalog_id)
+        if not pending:
+            db.set_state(self._gluten_complete_key(catalog_id), "1")
+            return {
+                "complete": True,
+                "products_checked": 0,
+                "checkpoint_reused": reused_products,
+                "batches_processed": 0,
+                "provider_usage": {"primary": 0, "backup": 0},
+                "errors": [],
+            }
+
         products_checked = 0
-        errors: list[str] = []
+        batches_processed = 0
         provider_usage = {"primary": 0, "backup": 0}
+        errors: list[str] = []
 
-        for image in rendered:
-            state_key = self._tacc_chunk_key(catalog_id, image.page, image.tile)
-            if db.get_state(state_key) == "1":
-                reused_chunks += 1
-                continue
-
-            offers = self._offers_for_image(catalog_id, image.page, image.tile)
-            if not offers:
-                db.set_state(state_key, "1")
-                verified_chunks += 1
-                continue
-
+        for offset in range(0, len(pending), GLUTEN_BATCH_SIZE):
+            batch = pending[offset:offset + GLUTEN_BATCH_SIZE]
             try:
-                result = await verify_sin_tacc_image(image.path, offers, settings)
+                result = await classify_gluten_text(batch, settings)
                 provider = result.get("provider_used")
                 if provider in provider_usage:
                     provider_usage[provider] += 1
+
                 rows = result.get("results") or []
                 with db.connect() as conn:
                     for row in rows:
-                        value = row.get("sin_tacc")
-                        db_value = None if value is None else (1 if value else 0)
+                        status = row.get("status")
+                        if status == "sin_gluten":
+                            db_value = 1
+                        elif status == "con_tacc":
+                            db_value = 0
+                        else:
+                            db_value = None
+                        oid = int(row["id"])
                         conn.execute(
                             "UPDATE offers SET sin_tacc=? WHERE id=? AND catalog_id=?",
-                            (db_value, int(row["id"]), catalog_id),
+                            (db_value, oid, catalog_id),
+                        )
+                        conn.execute(
+                            "INSERT INTO app_state(key,value) VALUES(?, '1') "
+                            "ON CONFLICT(key) DO UPDATE SET value='1'",
+                            (self._gluten_offer_key(catalog_id, oid),),
                         )
                         products_checked += 1
-                db.set_state(state_key, "1")
-                verified_chunks += 1
+                batches_processed += 1
             except Exception as exc:
-                message = f"p{image.page}/{image.tile}: {exc}"
+                message = f"lote {offset // GLUTEN_BATCH_SIZE + 1}: {exc}"
                 errors.append(message)
-                LOGGER.warning("SIN TACC pendiente %s catálogo %s: %s", image.tile, catalog_id, exc)
-                # Product/price extraction remains valid; this chunk will retry later.
+                LOGGER.warning("Clasificación gluten pendiente catálogo %s: %s", catalog_id, exc)
+                # Stop here: processed products remain checkpointed and the next scan resumes.
+                break
 
-        complete = not errors
-        db.set_state(self._tacc_complete_key(catalog_id), "1" if complete else "0")
+        remaining, total_reused = self._pending_food_offers(catalog_id)
+        complete = not remaining and not errors
+        db.set_state(self._gluten_complete_key(catalog_id), "1" if complete else "0")
         return {
             "complete": complete,
-            "verified_chunks": verified_chunks,
-            "checkpoint_reused": reused_chunks,
             "products_checked": products_checked,
+            "checkpoint_reused": total_reused,
+            "batches_processed": batches_processed,
+            "batch_size": GLUTEN_BATCH_SIZE,
+            "remaining": len(remaining),
             "provider_usage": provider_usage,
             "errors": errors[:10],
         }
