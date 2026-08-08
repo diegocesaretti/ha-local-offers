@@ -1,4 +1,4 @@
-# Ofertas Locales 0.3.0
+# Ofertas Locales 0.3.1
 
 ## Qué hace
 
@@ -13,113 +13,89 @@ La App consulta `https://www.supercaracol.com.ar/`, busca el enlace vigente a `h
 
 ## LLM principal + respaldo
 
-La App admite dos perfiles Vision:
+La App admite dos perfiles compatibles con OpenAI Chat Completions:
 
 - principal: `vision_api_base`, `vision_api_key`, `vision_model`
 - respaldo: `vision_backup_api_base`, `vision_backup_api_key`, `vision_backup_model`
 
-Activá el segundo con `vision_backup_enabled: true`.
+Activá el segundo con `vision_backup_enabled: true`. El principal se intenta primero; si agota reintentos o devuelve una respuesta inválida, esa unidad de trabajo se procesa con el backup. La siguiente vuelve a intentar primero el principal.
 
-El perfil principal siempre se intenta primero. Si agota sus reintentos o devuelve una respuesta inválida, la misma página/recorte se procesa con el perfil de respaldo. La página siguiente vuelve a intentar primero el principal.
-
-La Web UI muestra métricas persistentes de uso real:
-
-- éxitos/fallas del principal,
-- éxitos/fallas del respaldo,
-- cantidad de failovers,
-- último proveedor usado.
-
-El botón **Probar APIs LLM** prueba ambos perfiles pero no altera estas métricas.
+La Web UI muestra métricas persistentes de éxitos/fallas de ambos perfiles, cantidad de failovers y último proveedor usado. El botón **Probar APIs LLM** prueba ambos perfiles sin alterar las métricas de uso real.
 
 ## Control de carga y reintentos
 
-Las llamadas LLM pasan por un único limitador global y nunca salen simultáneamente.
-
-Con los defaults actuales:
+Las llamadas LLM pasan por un único limitador global y nunca salen simultáneamente. Con los defaults actuales:
 
 - pausa normal entre llamadas: `2 s`
 - reintento 1: `5 s`
 - reintento 2: `10 s`
 - reintento 3: `60 s`
 
-Si el servidor devuelve `Retry-After` mayor, la App respeta el tiempo más largo. Reintentos posteriores, si se configuran más de tres, continúan 120/240 s con tope defensivo de 300 s.
+Si el servidor devuelve un `Retry-After` mayor, la App respeta el tiempo más largo.
 
 ## Checkpoints y reanudación
 
-Cada página/recorte extraído correctamente se guarda inmediatamente como checkpoint persistente en `/data/checkpoints`.
-
-Si falla el LLM, se reinicia el contenedor o Home Assistant se interrumpe durante un catálogo:
-
-- los resultados ya correctos no se pierden,
-- al próximo escaneo del mismo PDF se reutilizan,
-- sólo se vuelven a enviar al LLM las páginas/recortes pendientes.
-
-El botón **Reanalizar** (`force`) sí borra los checkpoints de extracción del catálogo para obligar una lectura completa desde cero.
+Cada página/recorte extraído correctamente se guarda inmediatamente como checkpoint persistente en `/data/checkpoints`. Si el proceso se interrumpe, al próximo escaneo del mismo PDF sólo se procesan las partes pendientes. **Reanalizar** sí limpia esos checkpoints para forzar una lectura completa desde cero.
 
 ## Comparar precios Almacor ↔ Caracol
 
-La vista **Comparar precios** empareja de forma conservadora ofertas actuales usando marca, nombre y presentación.
-
-Ejemplos normalizados:
-
-- `2,25 L` ≈ `2250 ml` / `2250 cc`
-- `1 kg` ≈ `1000 g`
-
-Si la presentación es claramente distinta no se compara. Las promociones complejas (2x1, segunda unidad, combos) conservan su texto original para evitar interpretar mal el precio unitario.
+La vista **Comparar precios** empareja ofertas actuales de forma conservadora usando marca, nombre y presentación. Normaliza equivalencias como `2,25 L ≈ 2250 ml/cc` y `1 kg ≈ 1000 g`. Si la presentación es claramente diferente no compara. Las promociones complejas mantienen su texto original.
 
 ## Histórico y detección de ofertas reales
 
-La App conserva los catálogos anteriores y usa una observación por catálogo para construir el histórico de cada producto/presentación.
+La App conserva los catálogos anteriores y usa una observación por catálogo para construir el histórico de cada producto/presentación. Calcula mínimo histórico anterior, promedios de 30/60/90 días, variaciones porcentuales y cantidad de observaciones.
 
-Para cada oferta actual calcula, cuando hay datos suficientes:
+La UI clasifica el precio actual como **Nuevo mínimo**, **En mínimo histórico**, **Muy buena oferta**, **Buena oferta**, **Precio normal**, **Sobre el promedio** o **Sin historial**. La vista **Histórico / oportunidades** permite abrir el detalle de observaciones anteriores.
 
-- mínimo histórico anterior,
-- promedio de 30 días,
-- promedio de 60 días,
-- promedio de 90 días,
-- variación porcentual contra esos promedios,
-- cantidad de observaciones previas.
+## Semáforo gluten: ANMAT + LLM textual
 
-La UI clasifica el precio actual como:
+La clasificación de gluten ocurre **después** de que Vision terminó de extraer productos y precios y la base ya está guardada en SQLite. No se reenvían imágenes para esta etapa.
 
-- **Nuevo mínimo**
-- **En mínimo histórico**
-- **Muy buena oferta**
-- **Buena oferta**
-- **Precio normal**
-- **Sobre el promedio**
-- **Sin historial**
+Estados de UI:
 
-La vista **Histórico / oportunidades** ordena primero las mejores oportunidades y permite abrir el detalle de observaciones anteriores de cada producto.
+- **Verde — Sin Gluten**
+- **Amarillo — Indeterminado**
+- **Rojo — Con TACC**
 
-El matching histórico usa el mismo criterio conservador de producto/presentación que la comparación entre tiendas para evitar mezclar, por ejemplo, una botella de 1,5 L con una de 2,25 L.
+### 1. ANMAT / LIALG
 
-## SIN TACC en segunda pasada
+Con `anmat_enabled: true`, la App intenta consultar el buscador público del **Listado Integrado de Alimentos Libres de Gluten (LIALG)** de ANMAT/INAL.
 
-La verificación SIN TACC ya no forma parte de la extracción inicial.
+Las consultas se agrupan por marca y se cachean durante `anmat_cache_days` (7 días por defecto). Sólo una coincidencia fuerte, no ambigua y con estado **Vigente** puede producir un verde con fuente **ANMAT**.
 
-Proceso:
+La automatización del buscador es deliberadamente *best-effort*: el sitio público no se trata como una API contractual. Si cambia su HTML, está caído o no hay coincidencia suficientemente precisa, el catálogo continúa y el producto pasa al clasificador LLM.
 
-1. Vision extrae productos, precios, promociones y `is_food`.
-2. La App consolida y guarda esa base en SQLite.
-3. Sólo entonces hace una segunda pasada LLM sobre los alimentos/bebidas ya guardados, usando sus IDs de base de datos.
-4. Esa segunda pasada mira la página/recorte correspondiente y completa `sin_tacc`.
+Configuración:
 
-Regla estricta:
+- `anmat_url`: `https://listadoalg.anmat.gob.ar/Home`
+- `anmat_match_threshold`: `0.82`
+- `anmat_cache_days`: `7`
+- `anmat_delay_seconds`: `0.5`
+- `anmat_timeout_seconds`: `30`
 
-- `true`: sólo evidencia visual explícita SIN TACC/libre de gluten asociada al producto.
-- `false`: sólo declaración explícita de no apto/contiene gluten.
-- `null`: no hay evidencia suficiente.
+### 2. LLM textual
 
-No se infiere aptitud por marca, ingredientes supuestos o tipo de alimento.
+Los alimentos que ANMAT no pudo resolver se envían al LLM **sólo como texto**, en lotes de hasta 50, por ejemplo `Marca + nombre + variante + presentación`.
 
-La segunda pasada también tiene checkpoints. Si falla, el catálogo y sus precios siguen disponibles; los productos afectados aparecen como **SIN TACC no verificado** y la App intenta completar únicamente los recortes pendientes en un próximo escaneo.
+El LLM responde para cada ID:
+
+- `sin_gluten`
+- `con_tacc`
+- `indeterminado`
+- confianza de 0 a 1
+
+El clasificador debe preferir **indeterminado** ante dudas. Cada producto queda checkpointado individualmente, incluso si el resultado fue amarillo, por lo que una interrupción retoma sólo los IDs pendientes.
+
+La App guarda además `gluten_source` (`ANMAT` o `LLM`), `gluten_confidence` y detalle técnico del match/proveedor.
+
+> Importante: ANMAT indica que, para identificar un ALG seguro al momento de compra, deben verificarse simultáneamente el símbolo oficial en el rótulo y la presencia del producto con estado Vigente en el LIALG. Por eso el semáforo de la App es una ayuda de búsqueda y no reemplaza la revisión del envase.
 
 ## Configuración base
 
 - scraping: `168` horas (7 días)
 - Gemini directo como perfil principal por defecto
-- backup desactivado hasta cargar sus credenciales/modelo
+- backup desactivado hasta cargar credenciales/modelo
+- ANMAT habilitado
 - `image_mode: full`
 - `llm_delay_seconds: 2`
 - `llm_max_retries: 3`
@@ -129,4 +105,4 @@ La segunda pasada también tiene checkpoints. Si falla, el catálogo y sus preci
 
 La App publica `sensor.local_offers` y dispara `local_offers_catalog_updated` al procesar un catálogo.
 
-> La extracción, matching e histórico son automáticos, pero en promociones complejas o diferencias importantes conviene abrir el PDF original desde la propia UI.
+> La extracción, matching e histórico son automáticos, pero ante promociones complejas o diferencias importantes conviene abrir el PDF original desde la UI.
