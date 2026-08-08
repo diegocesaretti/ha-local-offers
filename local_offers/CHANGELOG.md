@@ -1,16 +1,30 @@
 # Changelog
 
+## 0.3.2
+
+- ANMAT pasa de consultas por marca a usar el **Excel completo** de `Exportar a Excel` del LIALG.
+- El Excel se refresca al relevamiento y se reutiliza durante 12 h para evitar descargas repetidas en escaneos manuales.
+- Si ANMAT falla, sólo se acepta la copia local como fuente de VERDE mientras esté dentro del máximo configurado (`anmat_cache_days`, 7 días por defecto).
+- El parser acepta XLSX, XLS y CSV y exige estado `Vigente` para un match verde ANMAT.
+- Se conserva una única copia local reemplazable del listado ANMAT.
+- Limpieza automática de almacenamiento al iniciar y después de cada escaneo.
+- Los JPEG renderizados se consideran temporales y se eliminan entre escaneos.
+- Los checkpoints de extracción se eliminan cuando el catálogo ya fue consolidado en SQLite; sólo se conservan para catálogos incompletos/error.
+- Los checkpoints de gluten por producto se colapsan al completar la clasificación.
+- Por defecto se conserva sólo el PDF más reciente de cada supermercado; los PDFs de catálogos incompletos nunca se purgan.
+- El histórico completo de productos/precios permanece en SQLite aunque el PDF histórico sea eliminado.
+- La API de estado informa uso de almacenamiento por base de datos, PDFs, renders, checkpoints y ANMAT.
+
 ## 0.3.1
 
 - La clasificación de gluten deja de reenviar imágenes al LLM: trabaja sobre la lista textual de productos ya guardada en SQLite.
 - Semáforo de alimentos: **Verde = Sin Gluten**, **Amarillo = indeterminado**, **Rojo = Con TACC**.
-- Integración best-effort con el Listado Integrado de Alimentos Libres de Gluten (LIALG) de ANMAT/INAL.
+- Integración con el Listado Integrado de Alimentos Libres de Gluten (LIALG) de ANMAT/INAL.
 - Los matches fuertes, no ambiguos y con estado `Vigente` se marcan como **Sin Gluten · ANMAT**.
 - Los productos que ANMAT no resuelve pasan al clasificador LLM textual en lotes de hasta 50.
 - Cada estado guarda fuente (`ANMAT`/`LLM`), confianza y detalle técnico.
 - Checkpoint por producto: una interrupción continúa sólo con los alimentos todavía no clasificados.
-- Búsquedas ANMAT agrupadas por marca, cacheadas 7 días y con pausa configurable para no sobrecargar el sitio público.
-- Un fallo/cambio de HTML de ANMAT no bloquea el catálogo: se usa el fallback LLM textual.
+- Un fallo de ANMAT no bloquea el catálogo: se usa el fallback LLM textual.
 
 ## 0.3.0
 
@@ -25,7 +39,6 @@
 - Clasificación de oportunidades: nuevo mínimo, mínimo histórico, muy buena, buena, normal, sobre promedio y sin historial.
 - Nueva vista **Histórico / oportunidades** y detalle de observaciones anteriores.
 - La comparación Almacor ↔ Caracol incorpora contexto histórico de cada precio.
-- SIN TACC pasó inicialmente a una segunda etapa separada de la extracción de precios; en 0.3.1 esa etapa fue reemplazada por clasificación textual + ANMAT.
 
 ## 0.2.0
 
