@@ -32,7 +32,11 @@ class Settings(BaseModel):
     anmat_enabled: bool = True
     anmat_url: str = "https://listadoalg.anmat.gob.ar/Home"
     anmat_match_threshold: float = Field(default=0.82, ge=0.65, le=1.0)
+    # Reuse a recently downloaded full Excel during repeated manual scans.
+    anmat_refresh_hours: int = Field(default=12, ge=1, le=168)
+    # Maximum age accepted only as fallback if ANMAT cannot be reached.
     anmat_cache_days: int = Field(default=7, ge=1, le=30)
+    # Kept for compatibility with existing options; the Excel importer no longer queries per brand.
     anmat_delay_seconds: float = Field(default=0.5, ge=0, le=10)
     anmat_timeout_seconds: float = Field(default=30.0, ge=5, le=120)
 
@@ -40,6 +44,10 @@ class Settings(BaseModel):
     render_dpi: int = Field(default=170, ge=100, le=240)
     jpeg_quality: int = Field(default=88, ge=60, le=95)
     max_pages: int = Field(default=40, ge=1, le=100)
+
+    # Storage retention: keep historical data in SQLite, not heavy historical files.
+    cleanup_enabled: bool = True
+    keep_pdfs_per_source: int = Field(default=1, ge=0, le=5)
 
     # Shared rate-limit/retry policy for primary and backup providers.
     llm_delay_seconds: float = Field(default=2.0, ge=0, le=120)
