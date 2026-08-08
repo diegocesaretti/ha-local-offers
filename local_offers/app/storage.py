@@ -18,8 +18,7 @@ DB_PATH = DATA_ROOT / 'offers.db'
 
 
 def _size(path: Path) -> int:
-    if not path.exists():
-        return 0
+    if not path.exists(): return 0
     if path.is_file():
         try: return path.stat().st_size
         except OSError: return 0
@@ -50,21 +49,34 @@ def _catalog_rows() -> list[dict[str, Any]]:
         ).fetchall()]
 
 
-def _keep_pdf_paths(rows: list[dict[str, Any]], keep_per_source: int) -> set[Path]:
-    keep: set[Path] = set()
+def _retention(rows: list[dict[str, Any]], keep_per_source: int) -> tuple[set[Path], set[str]]:
+    keep_paths: set[Path] = set()
+    resume_hashes: set[str] = set()
     ready_count: dict[str, int] = {}
+    seen_source: set[str] = set()
+
+    # Rows arrive newest first. Only the newest non-ready catalog for a source deserves
+    # resume protection; stale errors/downloads from older weeks are garbage.
     for row in rows:
-        path = Path(str(row.get('pdf_path') or ''))
-        status = str(row.get('status') or '')
         source = str(row.get('source') or '')
+        status = str(row.get('status') or '')
+        path_text = str(row.get('pdf_path') or '')
+        is_latest_for_source = source not in seen_source
+        if is_latest_for_source:
+            seen_source.add(source)
+
         if status != 'ready':
-            keep.add(path)
+            if is_latest_for_source and path_text:
+                keep_paths.add(Path(path_text))
+                resume_hashes.add(str(row.get('sha256') or '')[:24])
             continue
+
         count = ready_count.get(source, 0)
-        if count < keep_per_source:
-            keep.add(path)
+        if count < keep_per_source and path_text:
+            keep_paths.add(Path(path_text))
             ready_count[source] = count + 1
-    return keep
+
+    return keep_paths, resume_hashes
 
 
 def _remove_empty_dirs(root: Path) -> None:
@@ -81,10 +93,11 @@ def _cleanup_app_state() -> int:
         for key in completed:
             catalog_id = key.rsplit(':', 1)[-1]
             cur = conn.execute("DELETE FROM app_state WHERE key LIKE ?", (f'gluten_text_offer:{catalog_id}:%',))
-            removed += cur.rowcount if cur.rowcount > 0 else 0
+            removed += max(0, cur.rowcount)
+        # v0.2/v0.3.1 leftovers no longer used by current code.
         for pattern in ('sin_tacc_chunk:%', 'sin_tacc_complete:%', 'anmat_brand_v1:%'):
             cur = conn.execute('DELETE FROM app_state WHERE key LIKE ?', (pattern,))
-            removed += cur.rowcount if cur.rowcount > 0 else 0
+            removed += max(0, cur.rowcount)
     return removed
 
 
@@ -94,27 +107,26 @@ def cleanup_storage(settings: Settings) -> dict[str, Any]:
         return {'enabled': False, 'before': before, 'after': before}
 
     rows = _catalog_rows()
-    keep_pdfs = _keep_pdf_paths(rows, settings.keep_pdfs_per_source)
-    incomplete_hashes = {str(r.get('sha256') or '')[:24] for r in rows if str(r.get('status') or '') != 'ready'}
+    keep_pdfs, resume_hashes = _retention(rows, settings.keep_pdfs_per_source)
     deleted_pdfs = 0
     deleted_checkpoint_dirs = 0
 
-    # JPEG renders are reproducible working files; never retain them between scans.
+    # JPEG renders are fully reproducible working files.
     if RENDER_ROOT.exists():
         shutil.rmtree(RENDER_ROOT, ignore_errors=True)
 
-    # Successful extraction checkpoints are redundant once SQLite has the products.
+    # Checkpoints survive only for the newest unfinished catalog of each source.
     if CHECKPOINT_ROOT.exists():
-        for folder in CHECKPOINT_ROOT.iterdir():
-            if folder.is_dir() and folder.name not in incomplete_hashes:
-                shutil.rmtree(folder, ignore_errors=True)
+        for item in CHECKPOINT_ROOT.iterdir():
+            if item.is_dir() and item.name not in resume_hashes:
+                shutil.rmtree(item, ignore_errors=True)
                 deleted_checkpoint_dirs += 1
-            elif folder.is_file() and folder.suffix == '.tmp':
-                folder.unlink(missing_ok=True)
+            elif item.is_file() and item.suffix == '.tmp':
+                item.unlink(missing_ok=True)
 
-    # Keep incomplete PDFs for resume and only N latest ready PDFs per supermarket.
+    # Keep current ready PDFs according to retention plus a current unfinished PDF for resume.
     if CATALOG_ROOT.exists():
-        keep_resolved = {p.resolve() for p in keep_pdfs if str(p)}
+        keep_resolved = {p.resolve() for p in keep_pdfs}
         for pdf in CATALOG_ROOT.rglob('catalog.pdf'):
             try: resolved = pdf.resolve()
             except OSError: resolved = pdf
@@ -126,7 +138,6 @@ def cleanup_storage(settings: Settings) -> dict[str, Any]:
                     LOGGER.warning('No se pudo borrar PDF viejo %s', pdf)
         _remove_empty_dirs(CATALOG_ROOT)
 
-    # Remove orphan temp files anywhere under our own data folders.
     for root in (CATALOG_ROOT, CHECKPOINT_ROOT, ANMAT_ROOT):
         if root.exists():
             for tmp in root.rglob('*.tmp'):
