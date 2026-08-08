@@ -7,12 +7,13 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from . import checkpoints, db
-from .anmat import match_products_anmat
+from .anmat_excel import get_dataset, match_products_anmat_excel
 from .config import Settings, load_settings
 from .gluten import classify_gluten_text
 from .ha import fire_catalog_event, publish_summary
 from .render import RenderedImage, render_pdf
 from .sources import DownloadedCatalog, fetch_almacor, fetch_caracol
+from .storage import cleanup_storage
 from .vision import analyze_image, deduplicate_products
 
 LOGGER = logging.getLogger(__name__)
@@ -32,9 +33,17 @@ class ScanManager:
             return {"ok": False, "message": "Ya hay un escaneo en curso."}
         async with self.lock:
             self.running = True
+            settings = load_settings()
             try:
-                settings = load_settings()
                 self._ensure_gluten_columns()
+
+                # Refresh the complete official ANMAT Excel once per survey. Repeated manual
+                # scans inside anmat_refresh_hours reuse the current local copy.
+                anmat_dataset = await get_dataset(settings, force=False)
+                anmat_summary = {k: v for k, v in anmat_dataset.items() if k != "rows"}
+                if anmat_dataset.get("rows") is not None:
+                    anmat_summary["rows"] = len(anmat_dataset.get("rows") or [])
+
                 results = []
                 jobs: list[tuple[str, Callable[[], Awaitable[DownloadedCatalog]]]] = [
                     ("Almacor", lambda: fetch_almacor(settings.almacor_url, CATALOG_ROOT)),
@@ -53,9 +62,17 @@ class ScanManager:
                     except Exception as exc:
                         LOGGER.exception("Error procesando %s", name)
                         results.append({"source": name, "ok": False, "error": str(exc)})
+
+                cleanup = cleanup_storage(settings)
                 current_stats = db.stats()
                 await publish_summary(current_stats)
-                result = {"ok": True, "sources": results, "stats": current_stats}
+                result = {
+                    "ok": True,
+                    "sources": results,
+                    "stats": current_stats,
+                    "anmat": anmat_summary,
+                    "cleanup": cleanup,
+                }
                 self.last_result = result
                 return result
             finally:
@@ -194,7 +211,10 @@ class ScanManager:
                 source=catalog.source,
             )
 
-            # Products/prices are safely in SQLite before gluten classification begins.
+            # Extraction succeeded: the page checkpoints are now redundant because SQLite
+            # contains the complete product list. Gluten classification is text-only.
+            checkpoints.clear_catalog(catalog.sha256)
+
             self._clear_gluten_state(catalog_id)
             gluten = await self._classify_gluten(catalog_id, settings, reset=False)
             history_updated = db.refresh_history_metrics(catalog.source)
@@ -348,6 +368,13 @@ class ScanManager:
                 (self._gluten_offer_key(catalog_id, offer_id),),
             )
 
+    def _collapse_gluten_checkpoints(self, catalog_id: int) -> None:
+        with db.connect() as conn:
+            conn.execute(
+                "DELETE FROM app_state WHERE key LIKE ?",
+                (f"gluten_text_offer:{catalog_id}:%",),
+            )
+
     async def _classify_gluten(
         self,
         catalog_id: int,
@@ -360,6 +387,7 @@ class ScanManager:
         pending, reused_products = self._pending_food_offers(catalog_id)
         if not pending:
             db.set_state(self._gluten_complete_key(catalog_id), "1")
+            self._collapse_gluten_checkpoints(catalog_id)
             return {
                 "complete": True,
                 "products_checked": 0,
@@ -375,8 +403,8 @@ class ScanManager:
         provider_usage = {"primary": 0, "backup": 0}
         errors: list[str] = []
 
-        # 1) Official best-effort lookup: only strong, unambiguous LIALG Vigente matches become green ANMAT.
-        anmat = await match_products_anmat(pending, settings)
+        # 1) Official LIALG complete Excel: only strong, unambiguous Vigente matches become green ANMAT.
+        anmat = await match_products_anmat_excel(pending, settings)
         for oid, match in (anmat.get("matches") or {}).items():
             self._save_gluten_result(
                 catalog_id,
@@ -390,7 +418,7 @@ class ScanManager:
 
         errors.extend(f"ANMAT: {x}" for x in (anmat.get("errors") or []))
 
-        # 2) Everything ANMAT could not resolve is classified from the already-scraped product text.
+        # 2) Everything ANMAT could not resolve is classified from already-scraped text.
         pending, _ = self._pending_food_offers(catalog_id)
         for offset in range(0, len(pending), GLUTEN_BATCH_SIZE):
             batch = pending[offset:offset + GLUTEN_BATCH_SIZE]
@@ -418,19 +446,22 @@ class ScanManager:
                 message = f"LLM lote {offset // GLUTEN_BATCH_SIZE + 1}: {exc}"
                 errors.append(message)
                 LOGGER.warning("Clasificación gluten pendiente catálogo %s: %s", catalog_id, exc)
-                # Stop here: products already classified by ANMAT/LLM remain checkpointed.
                 break
 
         remaining, total_reused = self._pending_food_offers(catalog_id)
         complete = not remaining
         db.set_state(self._gluten_complete_key(catalog_id), "1" if complete else "0")
+        if complete:
+            self._collapse_gluten_checkpoints(catalog_id)
         return {
             "complete": complete,
             "products_checked": products_checked,
             "checkpoint_reused": total_reused,
             "anmat_matches": len(anmat.get("matches") or {}),
-            "anmat_brands": anmat.get("brands", 0),
-            "anmat_queries": anmat.get("queries", 0),
+            "anmat_dataset_rows": anmat.get("dataset_rows", 0),
+            "anmat_dataset_kind": anmat.get("dataset_kind"),
+            "anmat_dataset_cached": anmat.get("dataset_cached"),
+            "anmat_dataset_age_hours": anmat.get("dataset_age_hours"),
             "batches_processed": batches_processed,
             "batch_size": GLUTEN_BATCH_SIZE,
             "remaining": len(remaining),
