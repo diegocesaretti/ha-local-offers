@@ -4,7 +4,7 @@ Home Assistant App para detectar catálogos de supermercados locales, descargar 
 
 ## Estado
 
-Versión actual: `v0.3.1`.
+Versión actual: `v0.3.2`.
 
 Fuentes actuales:
 
@@ -24,10 +24,10 @@ Fuentes actuales:
 - Histórico por producto: mínimo anterior, promedios 30/60/90 días y variación porcentual.
 - Vista **Histórico / oportunidades** para distinguir ofertas reales de precios normales o altos.
 - Semáforo gluten posterior al scraping: **Verde Sin Gluten / Amarillo indeterminado / Rojo Con TACC**.
-- Integración best-effort con el listado oficial LIALG de ANMAT/INAL; matches Vigentes fuertes se identifican como **Sin Gluten · ANMAT**.
+- ANMAT/INAL mediante el **Excel completo exportado por el LIALG**; sólo matches fuertes, no ambiguos y `Vigente` se identifican como **Sin Gluten · ANMAT**.
 - Lo no resuelto por ANMAT se clasifica con LLM sobre texto en lotes de hasta 50, sin reenviar imágenes.
-- Checkpoint individual de la clasificación gluten y fuente/confianza visibles en la UI.
-- Enlace al PDF/fuente original para verificar cada oferta.
+- Limpieza automática: conserva el histórico liviano en SQLite, elimina renders temporales/checkpoints completados y guarda por defecto sólo el PDF más reciente de cada supermercado.
+- La copia del Excel ANMAT es única y reemplazable; no se acumulan exportaciones viejas.
 
 También permite usar proveedores compatibles con OpenAI Chat Completions como Groq, OpenRouter u otros endpoints configurables.
 
