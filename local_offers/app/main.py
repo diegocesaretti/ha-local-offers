@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from . import db
 from .config import load_settings
 from .processor import ScanManager
+from .storage import cleanup_storage, storage_stats
 from .vision import get_llm_metrics, test_vision_api
 
 logging.basicConfig(
@@ -37,13 +38,18 @@ async def scheduler_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    settings = load_settings()
+    try:
+        cleanup = cleanup_storage(settings)
+        LOGGER.info("Limpieza inicial completada: %s bytes liberados", cleanup.get("freed_bytes", 0))
+    except Exception:
+        LOGGER.exception("No se pudo ejecutar la limpieza inicial")
     try:
         updated = db.refresh_history_metrics()
         LOGGER.info("Métricas históricas actualizadas al iniciar: %s ofertas", updated)
     except Exception:
         LOGGER.exception("No se pudieron recalcular métricas históricas al iniciar")
     scheduler = asyncio.create_task(scheduler_loop())
-    settings = load_settings()
     startup_task = None
     if settings.scan_on_start:
         startup_task = asyncio.create_task(manager.scan_all(force=False))
@@ -55,7 +61,7 @@ async def lifespan(app: FastAPI):
             startup_task.cancel()
 
 
-app = FastAPI(title="Ofertas Locales", version="0.3.1", lifespan=lifespan)
+app = FastAPI(title="Ofertas Locales", version="0.3.2", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -77,6 +83,7 @@ async def status():
     return {
         "running": manager.running,
         "stats": db.stats(),
+        "storage": storage_stats(),
         "catalogs": db.latest_catalogs(10),
         "last_result": manager.last_result,
         "llm_metrics": get_llm_metrics(),
@@ -95,7 +102,10 @@ async def status():
             "anmat_enabled": settings.anmat_enabled,
             "anmat_url": settings.anmat_url,
             "anmat_match_threshold": settings.anmat_match_threshold,
+            "anmat_refresh_hours": settings.anmat_refresh_hours,
             "anmat_cache_days": settings.anmat_cache_days,
+            "cleanup_enabled": settings.cleanup_enabled,
+            "keep_pdfs_per_source": settings.keep_pdfs_per_source,
             "api_key_configured": bool(settings.vision_api_key),
             "backup_api_key_configured": bool(settings.vision_backup_api_key),
             "llm_delay_seconds": settings.llm_delay_seconds,
@@ -155,7 +165,7 @@ async def catalog_pdf(catalog_id: int):
         raise HTTPException(404, "Catálogo no encontrado")
     path = Path(catalog["pdf_path"])
     if not path.exists():
-        raise HTTPException(404, "PDF no disponible")
+        raise HTTPException(404, "PDF histórico purgado; el historial de precios sigue disponible.")
     return FileResponse(path, media_type="application/pdf", filename=f"catalog-{catalog_id}.pdf")
 
 
