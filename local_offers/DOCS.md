@@ -1,4 +1,4 @@
-# Ofertas Locales 0.3.1
+# Ofertas Locales 0.3.2
 
 ## Qué hace
 
@@ -35,7 +35,9 @@ Si el servidor devuelve un `Retry-After` mayor, la App respeta el tiempo más la
 
 ## Checkpoints y reanudación
 
-Cada página/recorte extraído correctamente se guarda inmediatamente como checkpoint persistente en `/data/checkpoints`. Si el proceso se interrumpe, al próximo escaneo del mismo PDF sólo se procesan las partes pendientes. **Reanalizar** sí limpia esos checkpoints para forzar una lectura completa desde cero.
+Cada página/recorte extraído correctamente se guarda inmediatamente como checkpoint persistente. Si el proceso se interrumpe, el siguiente escaneo del mismo PDF reutiliza lo ya procesado.
+
+Cuando la extracción completa queda consolidada en SQLite, esos checkpoints se eliminan automáticamente. Sólo se conserva el checkpoint del catálogo incompleto más reciente de cada supermercado. **Reanalizar** fuerza una lectura completa desde cero.
 
 ## Comparar precios Almacor ↔ Caracol
 
@@ -43,9 +45,11 @@ La vista **Comparar precios** empareja ofertas actuales de forma conservadora us
 
 ## Histórico y detección de ofertas reales
 
-La App conserva los catálogos anteriores y usa una observación por catálogo para construir el histórico de cada producto/presentación. Calcula mínimo histórico anterior, promedios de 30/60/90 días, variaciones porcentuales y cantidad de observaciones.
+La App conserva en SQLite una observación por catálogo para construir el histórico de cada producto/presentación. Calcula mínimo histórico anterior, promedios de 30/60/90 días, variaciones porcentuales y cantidad de observaciones.
 
 La UI clasifica el precio actual como **Nuevo mínimo**, **En mínimo histórico**, **Muy buena oferta**, **Buena oferta**, **Precio normal**, **Sobre el promedio** o **Sin historial**. La vista **Histórico / oportunidades** permite abrir el detalle de observaciones anteriores.
+
+El histórico no depende de conservar los PDFs viejos: los datos útiles quedan en SQLite aunque el archivo pesado haya sido purgado.
 
 ## Semáforo gluten: ANMAT + LLM textual
 
@@ -57,20 +61,27 @@ Estados de UI:
 - **Amarillo — Indeterminado**
 - **Rojo — Con TACC**
 
-### 1. ANMAT / LIALG
+### 1. ANMAT / LIALG mediante Excel completo
 
-Con `anmat_enabled: true`, la App intenta consultar el buscador público del **Listado Integrado de Alimentos Libres de Gluten (LIALG)** de ANMAT/INAL.
+Con `anmat_enabled: true`, al comenzar un relevamiento la App intenta usar el botón público **Exportar a Excel** del Listado Integrado de Alimentos Libres de Gluten (LIALG) de ANMAT/INAL.
 
-Las consultas se agrupan por marca y se cachean durante `anmat_cache_days` (7 días por defecto). Sólo una coincidencia fuerte, no ambigua y con estado **Vigente** puede producir un verde con fuente **ANMAT**.
+El export completo se descarga y se guarda como **una única copia local reemplazable** en `/data/anmat`. El importador acepta XLSX, XLS y CSV.
 
-La automatización del buscador es deliberadamente *best-effort*: el sitio público no se trata como una API contractual. Si cambia su HTML, está caído o no hay coincidencia suficientemente precisa, el catálogo continúa y el producto pasa al clasificador LLM.
+Política por defecto:
+
+- intenta refrescar el listado al relevamiento;
+- si hubo otra descarga hace menos de `anmat_refresh_hours` (12 h), la reutiliza para evitar descargas repetidas durante pruebas manuales;
+- si ANMAT está temporalmente caído, sólo acepta la copia local como fuente de VERDE mientras tenga menos de `anmat_cache_days` (7 días);
+- una copia más vieja no se usa para certificar un verde ANMAT.
+
+Sólo una coincidencia fuerte, no ambigua y cuya fila tenga estado **Vigente** puede producir **Sin Gluten · ANMAT**. No encontrar un producto en el listado jamás lo convierte automáticamente en rojo.
 
 Configuración:
 
 - `anmat_url`: `https://listadoalg.anmat.gob.ar/Home`
 - `anmat_match_threshold`: `0.82`
+- `anmat_refresh_hours`: `12`
 - `anmat_cache_days`: `7`
-- `anmat_delay_seconds`: `0.5`
 - `anmat_timeout_seconds`: `30`
 
 ### 2. LLM textual
@@ -84,11 +95,33 @@ El LLM responde para cada ID:
 - `indeterminado`
 - confianza de 0 a 1
 
-El clasificador debe preferir **indeterminado** ante dudas. Cada producto queda checkpointado individualmente, incluso si el resultado fue amarillo, por lo que una interrupción retoma sólo los IDs pendientes.
+El clasificador debe preferir **indeterminado** ante dudas. Cada producto queda checkpointado individualmente mientras la clasificación está incompleta; al terminar se colapsan esos checkpoints para no ensuciar SQLite.
 
 La App guarda además `gluten_source` (`ANMAT` o `LLM`), `gluten_confidence` y detalle técnico del match/proveedor.
 
-> Importante: ANMAT indica que, para identificar un ALG seguro al momento de compra, deben verificarse simultáneamente el símbolo oficial en el rótulo y la presencia del producto con estado Vigente en el LIALG. Por eso el semáforo de la App es una ayuda de búsqueda y no reemplaza la revisión del envase.
+> ANMAT indica que, para identificar un ALG seguro al momento de compra, deben verificarse simultáneamente el símbolo oficial en el rótulo y la presencia del producto con estado Vigente en el LIALG. El semáforo es una ayuda de búsqueda y no reemplaza revisar el envase.
+
+## Limpieza automática de almacenamiento
+
+Con `cleanup_enabled: true` (default), la App limpia al arrancar y después de cada escaneo.
+
+Se eliminan automáticamente:
+
+- todos los JPEG renderizados una vez que ya no son necesarios;
+- checkpoints de catálogos completados;
+- checkpoints antiguos de catálogos que ya fueron reemplazados por uno más nuevo;
+- estados internos obsoletos de versiones anteriores;
+- PDFs históricos que excedan la retención configurada;
+- archivos temporales `.tmp` huérfanos.
+
+Se conservan:
+
+- `offers.db` con todo el histórico de precios;
+- por defecto el **PDF más reciente de cada supermercado** (`keep_pdfs_per_source: 1`);
+- el PDF/checkpoint del catálogo incompleto más reciente de cada supermercado, para poder reanudar;
+- una única copia actual/cacheada del Excel ANMAT.
+
+La API `/api/status` informa bytes usados por base de datos, PDFs, renders, checkpoints y ANMAT.
 
 ## Configuración base
 
@@ -96,6 +129,9 @@ La App guarda además `gluten_source` (`ANMAT` o `LLM`), `gluten_confidence` y d
 - Gemini directo como perfil principal por defecto
 - backup desactivado hasta cargar credenciales/modelo
 - ANMAT habilitado
+- `anmat_refresh_hours: 12`
+- `cleanup_enabled: true`
+- `keep_pdfs_per_source: 1`
 - `image_mode: full`
 - `llm_delay_seconds: 2`
 - `llm_max_retries: 3`
@@ -105,4 +141,4 @@ La App guarda además `gluten_source` (`ANMAT` o `LLM`), `gluten_confidence` y d
 
 La App publica `sensor.local_offers` y dispara `local_offers_catalog_updated` al procesar un catálogo.
 
-> La extracción, matching e histórico son automáticos, pero ante promociones complejas o diferencias importantes conviene abrir el PDF original desde la UI.
+> La extracción, matching e histórico son automáticos, pero ante promociones complejas o diferencias importantes conviene revisar la fuente original disponible.
