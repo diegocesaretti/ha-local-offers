@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
             startup_task.cancel()
 
 
-app = FastAPI(title="Ofertas Locales", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Ofertas Locales", version="0.3.1", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -92,6 +92,10 @@ async def status():
             "almacor_url": settings.almacor_url,
             "caracol_home_url": settings.caracol_home_url,
             "heyzine_url": settings.heyzine_url,
+            "anmat_enabled": settings.anmat_enabled,
+            "anmat_url": settings.anmat_url,
+            "anmat_match_threshold": settings.anmat_match_threshold,
+            "anmat_cache_days": settings.anmat_cache_days,
             "api_key_configured": bool(settings.vision_api_key),
             "backup_api_key_configured": bool(settings.vision_backup_api_key),
             "llm_delay_seconds": settings.llm_delay_seconds,
