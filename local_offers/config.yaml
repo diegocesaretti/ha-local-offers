@@ -1,6 +1,6 @@
 name: "Ofertas Locales"
 description: "Detecta catálogos de supermercados, extrae ofertas con LLM Vision y las integra con Home Assistant."
-version: "0.3.0"
+version: "0.3.1"
 slug: "local_offers"
 startup: application
 boot: auto
@@ -29,6 +29,12 @@ options:
   vision_backup_api_base: "https://openrouter.ai/api/v1"
   vision_backup_api_key: ""
   vision_backup_model: ""
+  anmat_enabled: true
+  anmat_url: "https://listadoalg.anmat.gob.ar/Home"
+  anmat_match_threshold: 0.82
+  anmat_cache_days: 7
+  anmat_delay_seconds: 0.5
+  anmat_timeout_seconds: 30
   image_mode: "full"
   render_dpi: 170
   jpeg_quality: 88
@@ -51,6 +57,12 @@ schema:
   vision_backup_api_base: str
   vision_backup_api_key: password
   vision_backup_model: str
+  anmat_enabled: bool
+  anmat_url: url
+  anmat_match_threshold: float
+  anmat_cache_days: "int(1,30)"
+  anmat_delay_seconds: float
+  anmat_timeout_seconds: float
   image_mode: "list(full|quarters)"
   render_dpi: "int(100,240)"
   jpeg_quality: "int(60,95)"
