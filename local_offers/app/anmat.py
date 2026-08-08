@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import re
-import time
 import unicodedata
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -31,9 +30,10 @@ def _norm(value: Any) -> str:
 
 
 def _product_text(item: dict[str, Any]) -> str:
+    # ANMAT's denomination does not necessarily include pack size/presentation.
     return _norm(" ".join(
         str(item.get(k) or "")
-        for k in ("brand", "name", "variant", "presentation")
+        for k in ("brand", "name", "variant")
     ))
 
 
@@ -130,7 +130,6 @@ def _form_payload(form, brand: str) -> tuple[dict[str, str], str | None]:
                     payload[state_field] = str(option.get("value") or option.get_text(strip=True))
                     break
 
-    # Include a conventional submit control when the server uses its name to distinguish actions.
     for tag in form.find_all(["button", "input"]):
         typ = str(tag.get("type") or "").lower()
         text = _norm(tag.get_text(" ", strip=True) if tag.name == "button" else tag.get("value"))
@@ -177,9 +176,18 @@ def _parse_rows(html: str) -> list[dict[str, str]]:
     return best
 
 
+def _row_match_text(row: dict[str, str]) -> str:
+    selected = [
+        value
+        for key, value in row.items()
+        if any(token in key for token in ("marca", "fantasia", "denominacion", "nombre"))
+    ]
+    return _norm(" ".join(selected) if selected else row.get("_text"))
+
+
 def _score(product: dict[str, Any], row: dict[str, str]) -> float:
     ptext = _product_text(product)
-    rtext = _norm(row.get("_text"))
+    rtext = _row_match_text(row)
     if not ptext or not rtext:
         return 0.0
     brand = _norm(product.get("brand"))
@@ -202,7 +210,7 @@ async def _fetch_brand_rows(brand: str, settings: Settings) -> tuple[list[dict[s
     if cached is not None:
         return cached, None
 
-    headers = {"User-Agent": "HA-Local-Offers/0.3 (+Home Assistant App)"}
+    headers = {"User-Agent": "HA-Local-Offers/0.3.1 (+Home Assistant App)"}
     async with httpx.AsyncClient(timeout=settings.anmat_timeout_seconds, follow_redirects=True, headers=headers) as client:
         home = await client.get(settings.anmat_url)
         home.raise_for_status()
@@ -227,7 +235,7 @@ async def _fetch_brand_rows(brand: str, settings: Settings) -> tuple[list[dict[s
 async def match_products_anmat(products: list[dict[str, Any]], settings: Settings) -> dict[str, Any]:
     """Best-effort LIALG matcher. Only strong, unambiguous Vigente matches are returned."""
     if not settings.anmat_enabled:
-        return {"matches": {}, "queries": 0, "cache_or_queries": 0, "errors": []}
+        return {"matches": {}, "queries": 0, "brands": 0, "errors": []}
 
     by_brand: dict[str, list[dict[str, Any]]] = {}
     for item in products:
@@ -257,7 +265,6 @@ async def match_products_anmat(products: list[dict[str, Any]], settings: Setting
                 if best_score < settings.anmat_match_threshold:
                     continue
                 if second_score >= best_score - 0.035:
-                    # Ambiguous between two registrations: do not certify automatically.
                     continue
                 oid = int(item["id"])
                 matches[oid] = {
