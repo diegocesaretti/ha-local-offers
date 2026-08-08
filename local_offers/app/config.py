@@ -28,6 +28,14 @@ class Settings(BaseModel):
     vision_backup_api_key: str = ""
     vision_backup_model: str = ""
 
+    # Official ANMAT/INAL Listado Integrado de Alimentos Libres de Gluten (LIALG).
+    anmat_enabled: bool = True
+    anmat_url: str = "https://listadoalg.anmat.gob.ar/Home"
+    anmat_match_threshold: float = Field(default=0.82, ge=0.65, le=1.0)
+    anmat_cache_days: int = Field(default=7, ge=1, le=30)
+    anmat_delay_seconds: float = Field(default=0.5, ge=0, le=10)
+    anmat_timeout_seconds: float = Field(default=30.0, ge=5, le=120)
+
     image_mode: str = "full"
     render_dpi: int = Field(default=170, ge=100, le=240)
     jpeg_quality: int = Field(default=88, ge=60, le=95)
