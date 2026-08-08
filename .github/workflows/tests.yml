@@ -28,24 +28,3 @@ jobs:
         env:
           PYTHONPATH: .
         run: pytest -q
-      - name: ANMAT Excel live smoke
-        continue-on-error: true
-        working-directory: local_offers
-        env:
-          PYTHONPATH: .
-        run: |
-          python - <<'PY'
-          import asyncio
-          from pathlib import Path
-          from app import db
-          from app.config import Settings
-          import app.anmat_excel as ae
-          db.DB_PATH = Path('/tmp/anmat-smoke.db')
-          ae.ROOT = Path('/tmp/anmat-data')
-          ae.DATASET = ae.ROOT / 'lialg-current.bin'
-          db.init_db()
-          result = asyncio.run(ae.get_dataset(Settings(anmat_refresh_hours=1), force=True))
-          print({k: (len(v) if k == 'rows' else v) for k, v in result.items()})
-          if not result.get('ok'):
-              raise SystemExit(2)
-          PY
