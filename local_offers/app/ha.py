@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import unicodedata
 from typing import Any
 
 import httpx
@@ -11,6 +13,30 @@ from . import db
 LOGGER = logging.getLogger(__name__)
 CORE_API = "http://supervisor/core/api"
 MEAL_CONTEXT_LIMIT = 25
+CLEANING_CONTEXT_LIMIT = 20
+
+DEAL_RANK = {
+    "nuevo_minimo": 7,
+    "minimo_historico": 6,
+    "muy_buena": 5,
+    "buena": 4,
+    "normal": 2,
+    "sin_historial": 1,
+    "por_encima": 0,
+    None: 1,
+}
+
+CLEANING_KEYWORDS = {
+    "detergente", "lavandina", "lejia", "desinfectante", "limpiador", "limpieza",
+    "limpiapisos", "limpia pisos", "limpiavidrios", "limpia vidrios", "desengrasante",
+    "jabon liquido ropa", "jabon para ropa", "jabon en polvo", "polvo para lavar",
+    "suavizante", "quitamanchas", "blanqueador", "apresto", "perfume para ropa",
+    "esponja", "virulana", "lana de acero", "rejilla", "trapo", "paño", "pano",
+    "bolsa de residuos", "bolsas de residuos", "bolsa basura", "bolsas basura",
+    "rollo cocina", "papel cocina", "toalla de papel", "servilleta", "papel higienico",
+    "insecticida", "repelente de insectos", "pastilla mosquitos", "aerosol mosquitos",
+    "limpiamuebles", "lustramuebles", "cera piso", "destapacañerias", "destapacanerias",
+}
 
 
 def _headers() -> dict[str, str] | None:
@@ -18,6 +44,13 @@ def _headers() -> dict[str, str] | None:
     if not token:
         return None
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+def _norm(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "").lower())
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
 
 
 def _gluten_status(item: dict[str, Any]) -> str:
@@ -29,62 +62,78 @@ def _gluten_status(item: dict[str, Any]) -> str:
     return "indeterminado"
 
 
+def _sort_key(item: dict[str, Any]):
+    promo_bonus = 1 if str(item.get("promotion_text") or "").strip() else 0
+    previous_bonus = 1 if item.get("previous_price") else 0
+    delta = item.get("change_vs_avg_30")
+    if delta is None:
+        delta = item.get("change_vs_avg_60")
+    if delta is None:
+        delta = item.get("change_vs_avg_90")
+    delta = float(delta) if delta is not None else 999.0
+    return (
+        DEAL_RANK.get(item.get("deal_label"), 1),
+        promo_bonus,
+        previous_bonus,
+        -delta,
+        item.get("history_count") or 0,
+    )
+
+
+def _compact_offer(item: dict[str, Any], include_gluten: bool = False) -> dict[str, Any]:
+    compact = {
+        "id": item.get("id"),
+        "store": item.get("source"),
+        "brand": item.get("brand"),
+        "name": item.get("name"),
+        "variant": item.get("variant"),
+        "presentation": item.get("presentation"),
+        "price": item.get("price"),
+        "previous_price": item.get("previous_price"),
+        "promotion": item.get("promotion_text"),
+        "deal": item.get("deal_label"),
+        "change_vs_avg_30": item.get("change_vs_avg_30"),
+        "historical_min": item.get("historical_min"),
+    }
+    if include_gluten:
+        compact["gluten"] = _gluten_status(item)
+        compact["gluten_source"] = item.get("gluten_source")
+    return compact
+
+
 def _meal_context(limit: int = MEAL_CONTEXT_LIMIT) -> dict[str, Any]:
     items = [
         item for item in db.list_offers(limit=1000)
         if item.get("is_food") in (1, True) and item.get("price") is not None
     ]
-    rank = {
-        "nuevo_minimo": 7,
-        "minimo_historico": 6,
-        "muy_buena": 5,
-        "buena": 4,
-        "normal": 2,
-        "sin_historial": 1,
-        "por_encima": 0,
-        None: 1,
-    }
-
-    def sort_key(item: dict[str, Any]):
-        promo_bonus = 1 if str(item.get("promotion_text") or "").strip() else 0
-        previous_bonus = 1 if item.get("previous_price") else 0
-        delta = item.get("change_vs_avg_30")
-        if delta is None:
-            delta = item.get("change_vs_avg_60")
-        if delta is None:
-            delta = item.get("change_vs_avg_90")
-        delta = float(delta) if delta is not None else 999.0
-        return (
-            rank.get(item.get("deal_label"), 1),
-            promo_bonus,
-            previous_bonus,
-            -delta,
-            item.get("history_count") or 0,
-        )
-
-    items.sort(key=sort_key, reverse=True)
-    selected = items[:max(1, int(limit))]
-    compact = []
-    for item in selected:
-        compact.append({
-            "id": item.get("id"),
-            "store": item.get("source"),
-            "brand": item.get("brand"),
-            "name": item.get("name"),
-            "variant": item.get("variant"),
-            "presentation": item.get("presentation"),
-            "price": item.get("price"),
-            "previous_price": item.get("previous_price"),
-            "promotion": item.get("promotion_text"),
-            "deal": item.get("deal_label"),
-            "change_vs_avg_30": item.get("change_vs_avg_30"),
-            "historical_min": item.get("historical_min"),
-            "gluten": _gluten_status(item),
-            "gluten_source": item.get("gluten_source"),
-        })
+    items.sort(key=_sort_key, reverse=True)
+    compact = [_compact_offer(item, include_gluten=True) for item in items[:max(1, int(limit))]]
     return {
         "offers": compact,
         "total_food_offers": len(items),
+        "published_offers": len(compact),
+    }
+
+
+def _is_cleaning_offer(item: dict[str, Any]) -> bool:
+    if item.get("is_food") in (1, True):
+        return False
+    text = _norm(" ".join(str(item.get(k) or "") for k in ("brand", "name", "variant", "presentation", "promotion_text")))
+    if not text:
+        return False
+    return any(_norm(keyword) in text for keyword in CLEANING_KEYWORDS)
+
+
+def _cleaning_context(limit: int = CLEANING_CONTEXT_LIMIT) -> dict[str, Any]:
+    items = [
+        item for item in db.list_offers(limit=1000)
+        if item.get("price") is not None and _is_cleaning_offer(item)
+    ]
+    items.sort(key=_sort_key, reverse=True)
+    compact = [_compact_offer(item) for item in items[:max(1, int(limit))]]
+    return {
+        "offers": compact,
+        "total_cleaning_offers": len(items),
         "published_offers": len(compact),
     }
 
@@ -131,15 +180,31 @@ async def publish_summary(stats: dict[str, Any]) -> None:
         },
     }
 
+    cleaning = _cleaning_context()
+    cleaning_payload = {
+        "state": str(cleaning["published_offers"]),
+        "attributes": {
+            "friendly_name": "Ofertas Locales - Contexto Limpieza",
+            "icon": "mdi:spray-bottle",
+            "unit_of_measurement": "productos",
+            "offers": cleaning["offers"],
+            "published_offers": cleaning["published_offers"],
+            "total_cleaning_offers": cleaning["total_cleaning_offers"],
+            "last_update": stats.get("last_update"),
+            "note": "Lista compacta de limpieza/lavadero/hogar para automatizaciones/LLM.",
+        },
+    }
+
     async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            await _post_state(client, headers, "sensor.local_offers", summary_payload)
-        except Exception as exc:
-            LOGGER.warning("No se pudo publicar sensor.local_offers: %s", exc)
-        try:
-            await _post_state(client, headers, "sensor.local_offers_meal_context", meal_payload)
-        except Exception as exc:
-            LOGGER.warning("No se pudo publicar sensor.local_offers_meal_context: %s", exc)
+        for entity_id, payload in (
+            ("sensor.local_offers", summary_payload),
+            ("sensor.local_offers_meal_context", meal_payload),
+            ("sensor.local_offers_cleaning_context", cleaning_payload),
+        ):
+            try:
+                await _post_state(client, headers, entity_id, payload)
+            except Exception as exc:
+                LOGGER.warning("No se pudo publicar %s: %s", entity_id, exc)
 
 
 async def fire_catalog_event(data: dict[str, Any]) -> None:
