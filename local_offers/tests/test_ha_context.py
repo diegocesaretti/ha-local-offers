@@ -1,8 +1,8 @@
 from app import ha
 
 
-def test_meal_context_filters_food_and_compacts(monkeypatch):
-    rows = [
+def _base_rows():
+    return [
         {
             "id": 1,
             "source": "Caracol",
@@ -24,27 +24,6 @@ def test_meal_context_filters_food_and_compacts(monkeypatch):
         {
             "id": 2,
             "source": "Almacor",
-            "brand": "Marca B",
-            "name": "Detergente limón",
-            "presentation": "750 ml",
-            "price": 999,
-            "is_food": 0,
-            "deal_label": "buena",
-        },
-    ]
-    monkeypatch.setattr(ha.db, "list_offers", lambda limit=1000: rows)
-    result = ha._meal_context()
-    assert result["published_offers"] == 1
-    assert result["offers"][0]["name"] == "Arroz"
-    assert result["offers"][0]["gluten"] == "sin_gluten"
-    assert result["offers"][0]["gluten_source"] == "ANMAT"
-
-
-def test_cleaning_context_detects_household_products(monkeypatch):
-    rows = [
-        {
-            "id": 10,
-            "source": "Caracol",
             "brand": "Ala",
             "name": "Jabón líquido para ropa",
             "variant": "Matic",
@@ -56,27 +35,78 @@ def test_cleaning_context_detects_household_products(monkeypatch):
             "history_count": 2,
         },
         {
-            "id": 11,
+            "id": 3,
             "source": "Caracol",
-            "brand": "Marca X",
-            "name": "Shampoo",
+            "brand": "Sedal",
+            "name": "Shampoo reparación",
             "presentation": "400 ml",
             "price": 3000,
             "is_food": 0,
             "deal_label": "buena",
+            "history_count": 3,
         },
         {
-            "id": 12,
+            "id": 4,
+            "source": "Caracol",
+            "brand": "Whiskas",
+            "name": "Alimento para gato",
+            "presentation": "1 kg",
+            "price": 5200,
+            "is_food": 0,
+            "deal_label": "nuevo_minimo",
+            "history_count": 6,
+        },
+        {
+            "id": 5,
             "source": "Almacor",
-            "brand": "Marca Y",
-            "name": "Fideos",
-            "presentation": "500 g",
-            "price": 900,
-            "is_food": 1,
-            "deal_label": "muy_buena",
+            "brand": "Marca Z",
+            "name": "Vaso plástico",
+            "presentation": "10 u",
+            "price": 800,
+            "is_food": 0,
+            "deal_label": "normal",
         },
     ]
-    monkeypatch.setattr(ha.db, "list_offers", lambda limit=1000: rows)
+
+
+def test_meal_context_filters_food_and_compacts(monkeypatch):
+    monkeypatch.setattr(ha.db, "list_offers", lambda limit=1000: _base_rows())
+    result = ha._meal_context()
+    assert result["published_offers"] == 1
+    assert result["offers"][0]["name"] == "Arroz"
+    assert result["offers"][0]["gluten"] == "sin_gluten"
+    assert result["offers"][0]["gluten_source"] == "ANMAT"
+    assert result["offers"][0]["category"] == "food"
+
+
+def test_cleaning_context_detects_household_products(monkeypatch):
+    monkeypatch.setattr(ha.db, "list_offers", lambda limit=1000: _base_rows())
     result = ha._cleaning_context()
     assert result["published_offers"] == 1
     assert result["offers"][0]["name"] == "Jabón líquido para ropa"
+    assert result["offers"][0]["category"] == "cleaning"
+
+
+def test_personal_care_context_excludes_cleaning(monkeypatch):
+    monkeypatch.setattr(ha.db, "list_offers", lambda limit=1000: _base_rows())
+    result = ha._personal_care_context()
+    assert result["published_offers"] == 1
+    assert result["offers"][0]["name"] == "Shampoo reparación"
+    assert result["offers"][0]["category"] == "personal_care"
+
+
+def test_pet_context_detects_pet_products(monkeypatch):
+    monkeypatch.setattr(ha.db, "list_offers", lambda limit=1000: _base_rows())
+    result = ha._pet_context()
+    assert result["published_offers"] == 1
+    assert result["offers"][0]["brand"] == "Whiskas"
+    assert result["offers"][0]["category"] == "pet"
+
+
+def test_best_deals_context_prioritizes_and_categories(monkeypatch):
+    monkeypatch.setattr(ha.db, "list_offers", lambda limit=1000: _base_rows())
+    result = ha._best_deals_context()
+    assert result["published_offers"] == 4
+    assert result["offers"][0]["brand"] == "Whiskas"
+    categories = {x["category"] for x in result["offers"]}
+    assert {"food", "cleaning", "personal_care", "pet"}.issubset(categories)
