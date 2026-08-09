@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 
 from . import db
 from .config import load_settings
+from .ha import publish_summary
 from .processor import ScanManager
 from .storage import cleanup_storage, storage_stats
 from .vision import get_llm_metrics, test_vision_api
@@ -49,6 +50,10 @@ async def lifespan(app: FastAPI):
         LOGGER.info("Métricas históricas actualizadas al iniciar: %s ofertas", updated)
     except Exception:
         LOGGER.exception("No se pudieron recalcular métricas históricas al iniciar")
+    try:
+        await publish_summary(db.stats())
+    except Exception:
+        LOGGER.exception("No se pudieron republicar los sensores de Ofertas Locales al iniciar")
     scheduler = asyncio.create_task(scheduler_loop())
     startup_task = None
     if settings.scan_on_start:
@@ -61,7 +66,7 @@ async def lifespan(app: FastAPI):
             startup_task.cancel()
 
 
-app = FastAPI(title="Ofertas Locales", version="0.3.2", lifespan=lifespan)
+app = FastAPI(title="Ofertas Locales", version="0.3.3", lifespan=lifespan)
 
 
 @app.middleware("http")
