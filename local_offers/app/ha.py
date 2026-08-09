@@ -32,7 +32,7 @@ DEAL_RANK = {
 CLEANING_KEYWORDS = {
     "detergente", "lavandina", "lejia", "desinfectante", "limpiador", "limpieza",
     "limpiapisos", "limpia pisos", "limpiavidrios", "limpia vidrios", "desengrasante",
-    "jabon liquido ropa", "jabon para ropa", "jabon en polvo", "polvo para lavar",
+    "jabon liquido ropa", "jabon liquido para ropa", "jabon para ropa", "jabon en polvo", "polvo para lavar",
     "suavizante", "quitamanchas", "blanqueador", "apresto", "perfume para ropa",
     "esponja", "virulana", "lana de acero", "rejilla", "trapo", "paño", "pano",
     "bolsa de residuos", "bolsas de residuos", "bolsa basura", "bolsas basura",
