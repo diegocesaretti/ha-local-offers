@@ -14,6 +14,9 @@ LOGGER = logging.getLogger(__name__)
 CORE_API = "http://supervisor/core/api"
 MEAL_CONTEXT_LIMIT = 25
 CLEANING_CONTEXT_LIMIT = 20
+PERSONAL_CARE_CONTEXT_LIMIT = 20
+PET_CONTEXT_LIMIT = 15
+BEST_DEALS_CONTEXT_LIMIT = 25
 
 DEAL_RANK = {
     "nuevo_minimo": 7,
@@ -36,6 +39,24 @@ CLEANING_KEYWORDS = {
     "rollo cocina", "papel cocina", "toalla de papel", "servilleta", "papel higienico",
     "insecticida", "repelente de insectos", "pastilla mosquitos", "aerosol mosquitos",
     "limpiamuebles", "lustramuebles", "cera piso", "destapacañerias", "destapacanerias",
+}
+
+PERSONAL_CARE_KEYWORDS = {
+    "shampoo", "acondicionador", "crema enjuague", "jabon tocador", "jabon corporal",
+    "gel de ducha", "desodorante", "antitranspirante", "pasta dental", "dentifrico",
+    "cepillo dental", "enjuague bucal", "hilo dental", "afeitadora", "maquina afeitar",
+    "espuma afeitar", "gel afeitar", "crema corporal", "crema manos", "protector solar",
+    "toallitas femeninas", "tampon", "pañal", "panal", "toallitas humedas", "algodon",
+    "hisopo", "alcohol en gel", "pañuelo descartable", "panuelo descartable",
+}
+
+PET_KEYWORDS = {
+    "alimento gato", "alimento para gato", "comida gato", "comida para gato", "cat chow",
+    "whiskas", "gati", "excellent gato", "purina gato", "sobre gato", "pouch gato",
+    "alimento perro", "alimento para perro", "comida perro", "comida para perro", "dog chow",
+    "pedigree", "excellent perro", "purina perro", "sobre perro", "pouch perro",
+    "arena gato", "arena sanitaria", "piedritas gato", "piedras sanitarias", "snack mascota",
+    "snack perro", "snack gato", "premio perro", "premio gato",
 }
 
 
@@ -80,7 +101,7 @@ def _sort_key(item: dict[str, Any]):
     )
 
 
-def _compact_offer(item: dict[str, Any], include_gluten: bool = False) -> dict[str, Any]:
+def _compact_offer(item: dict[str, Any], include_gluten: bool = False, category: str | None = None) -> dict[str, Any]:
     compact = {
         "id": item.get("id"),
         "store": item.get("source"),
@@ -95,56 +116,101 @@ def _compact_offer(item: dict[str, Any], include_gluten: bool = False) -> dict[s
         "change_vs_avg_30": item.get("change_vs_avg_30"),
         "historical_min": item.get("historical_min"),
     }
+    if category:
+        compact["category"] = category
     if include_gluten:
         compact["gluten"] = _gluten_status(item)
         compact["gluten_source"] = item.get("gluten_source")
     return compact
 
 
+def _text(item: dict[str, Any]) -> str:
+    return _norm(" ".join(str(item.get(k) or "") for k in ("brand", "name", "variant", "presentation", "promotion_text")))
+
+
+def _has_keyword(item: dict[str, Any], keywords: set[str]) -> bool:
+    text = _text(item)
+    return bool(text) and any(_norm(keyword) in text for keyword in keywords)
+
+
 def _meal_context(limit: int = MEAL_CONTEXT_LIMIT) -> dict[str, Any]:
-    items = [
-        item for item in db.list_offers(limit=1000)
-        if item.get("is_food") in (1, True) and item.get("price") is not None
-    ]
+    items = [item for item in db.list_offers(limit=1000) if item.get("is_food") in (1, True) and item.get("price") is not None]
     items.sort(key=_sort_key, reverse=True)
-    compact = [_compact_offer(item, include_gluten=True) for item in items[:max(1, int(limit))]]
-    return {
-        "offers": compact,
-        "total_food_offers": len(items),
-        "published_offers": len(compact),
-    }
-
-
-def _is_cleaning_offer(item: dict[str, Any]) -> bool:
-    if item.get("is_food") in (1, True):
-        return False
-    text = _norm(" ".join(str(item.get(k) or "") for k in ("brand", "name", "variant", "presentation", "promotion_text")))
-    if not text:
-        return False
-    return any(_norm(keyword) in text for keyword in CLEANING_KEYWORDS)
+    compact = [_compact_offer(item, include_gluten=True, category="food") for item in items[:max(1, int(limit))]]
+    return {"offers": compact, "total_food_offers": len(items), "published_offers": len(compact)}
 
 
 def _cleaning_context(limit: int = CLEANING_CONTEXT_LIMIT) -> dict[str, Any]:
     items = [
         item for item in db.list_offers(limit=1000)
-        if item.get("price") is not None and _is_cleaning_offer(item)
+        if item.get("price") is not None and item.get("is_food") not in (1, True) and _has_keyword(item, CLEANING_KEYWORDS)
     ]
     items.sort(key=_sort_key, reverse=True)
-    compact = [_compact_offer(item) for item in items[:max(1, int(limit))]]
-    return {
-        "offers": compact,
-        "total_cleaning_offers": len(items),
-        "published_offers": len(compact),
-    }
+    compact = [_compact_offer(item, category="cleaning") for item in items[:max(1, int(limit))]]
+    return {"offers": compact, "total_cleaning_offers": len(items), "published_offers": len(compact)}
+
+
+def _personal_care_context(limit: int = PERSONAL_CARE_CONTEXT_LIMIT) -> dict[str, Any]:
+    items = [
+        item for item in db.list_offers(limit=1000)
+        if item.get("price") is not None
+        and item.get("is_food") not in (1, True)
+        and not _has_keyword(item, CLEANING_KEYWORDS)
+        and _has_keyword(item, PERSONAL_CARE_KEYWORDS)
+    ]
+    items.sort(key=_sort_key, reverse=True)
+    compact = [_compact_offer(item, category="personal_care") for item in items[:max(1, int(limit))]]
+    return {"offers": compact, "total_personal_care_offers": len(items), "published_offers": len(compact)}
+
+
+def _pet_context(limit: int = PET_CONTEXT_LIMIT) -> dict[str, Any]:
+    items = [item for item in db.list_offers(limit=1000) if item.get("price") is not None and _has_keyword(item, PET_KEYWORDS)]
+    items.sort(key=_sort_key, reverse=True)
+    compact = [_compact_offer(item, category="pet") for item in items[:max(1, int(limit))]]
+    return {"offers": compact, "total_pet_offers": len(items), "published_offers": len(compact)}
+
+
+def _best_deals_context(limit: int = BEST_DEALS_CONTEXT_LIMIT) -> dict[str, Any]:
+    items = [
+        item for item in db.list_offers(limit=1000)
+        if item.get("price") is not None and item.get("deal_label") in {"nuevo_minimo", "minimo_historico", "muy_buena", "buena"}
+    ]
+    items.sort(key=_sort_key, reverse=True)
+    compact = []
+    for item in items[:max(1, int(limit))]:
+        if item.get("is_food") in (1, True):
+            category = "food"
+        elif _has_keyword(item, PET_KEYWORDS):
+            category = "pet"
+        elif _has_keyword(item, CLEANING_KEYWORDS):
+            category = "cleaning"
+        elif _has_keyword(item, PERSONAL_CARE_KEYWORDS):
+            category = "personal_care"
+        else:
+            category = "other"
+        compact.append(_compact_offer(item, include_gluten=(category == "food"), category=category))
+    return {"offers": compact, "total_good_deals": len(items), "published_offers": len(compact)}
 
 
 async def _post_state(client: httpx.AsyncClient, headers: dict[str, str], entity_id: str, payload: dict[str, Any]) -> None:
-    response = await client.post(
-        f"{CORE_API}/states/{entity_id}",
-        headers=headers,
-        json=payload,
-    )
+    response = await client.post(f"{CORE_API}/states/{entity_id}", headers=headers, json=payload)
     response.raise_for_status()
+
+
+def _context_payload(friendly_name: str, icon: str, context: dict[str, Any], stats: dict[str, Any], total_key: str, note: str) -> dict[str, Any]:
+    return {
+        "state": str(context["published_offers"]),
+        "attributes": {
+            "friendly_name": friendly_name,
+            "icon": icon,
+            "unit_of_measurement": "productos",
+            "offers": context["offers"],
+            "published_offers": context["published_offers"],
+            total_key: context.get(total_key, 0),
+            "last_update": stats.get("last_update"),
+            "note": note,
+        },
+    }
 
 
 async def publish_summary(stats: dict[str, Any]) -> None:
@@ -166,41 +232,37 @@ async def publish_summary(stats: dict[str, Any]) -> None:
     }
 
     meal = _meal_context()
-    meal_payload = {
-        "state": str(meal["published_offers"]),
-        "attributes": {
-            "friendly_name": "Ofertas Locales - Contexto Cocina",
-            "icon": "mdi:food-variant",
-            "unit_of_measurement": "productos",
-            "offers": meal["offers"],
-            "published_offers": meal["published_offers"],
-            "total_food_offers": meal["total_food_offers"],
-            "last_update": stats.get("last_update"),
-            "note": "Lista compacta para automatizaciones/LLM; el listado completo permanece en el Add-on.",
-        },
-    }
-
     cleaning = _cleaning_context()
-    cleaning_payload = {
-        "state": str(cleaning["published_offers"]),
-        "attributes": {
-            "friendly_name": "Ofertas Locales - Contexto Limpieza",
-            "icon": "mdi:spray-bottle",
-            "unit_of_measurement": "productos",
-            "offers": cleaning["offers"],
-            "published_offers": cleaning["published_offers"],
-            "total_cleaning_offers": cleaning["total_cleaning_offers"],
-            "last_update": stats.get("last_update"),
-            "note": "Lista compacta de limpieza/lavadero/hogar para automatizaciones/LLM.",
-        },
-    }
+    personal = _personal_care_context()
+    pet = _pet_context()
+    best = _best_deals_context()
+
+    payloads = (
+        ("sensor.local_offers", summary_payload),
+        ("sensor.local_offers_meal_context", _context_payload(
+            "Ofertas Locales - Contexto Cocina", "mdi:food-variant", meal, stats, "total_food_offers",
+            "Ofertas alimentarias compactas para recetas y sugerencias de comida.",
+        )),
+        ("sensor.local_offers_cleaning_context", _context_payload(
+            "Ofertas Locales - Contexto Limpieza", "mdi:spray-bottle", cleaning, stats, "total_cleaning_offers",
+            "Ofertas compactas de limpieza, lavadero y hogar.",
+        )),
+        ("sensor.local_offers_personal_care_context", _context_payload(
+            "Ofertas Locales - Contexto Cuidado Personal", "mdi:shower-head", personal, stats, "total_personal_care_offers",
+            "Ofertas compactas de higiene y cuidado personal.",
+        )),
+        ("sensor.local_offers_pet_context", _context_payload(
+            "Ofertas Locales - Contexto Mascotas", "mdi:paw", pet, stats, "total_pet_offers",
+            "Ofertas compactas de alimento, snacks y productos para mascotas.",
+        )),
+        ("sensor.local_offers_best_deals_context", _context_payload(
+            "Ofertas Locales - Mejores Oportunidades", "mdi:fire", best, stats, "total_good_deals",
+            "Mejores oportunidades actuales de cualquier categoría, priorizadas por histórico y promociones.",
+        )),
+    )
 
     async with httpx.AsyncClient(timeout=15) as client:
-        for entity_id, payload in (
-            ("sensor.local_offers", summary_payload),
-            ("sensor.local_offers_meal_context", meal_payload),
-            ("sensor.local_offers_cleaning_context", cleaning_payload),
-        ):
+        for entity_id, payload in payloads:
             try:
                 await _post_state(client, headers, entity_id, payload)
             except Exception as exc:
@@ -213,11 +275,7 @@ async def fire_catalog_event(data: dict[str, Any]) -> None:
         return
     async with httpx.AsyncClient(timeout=15) as client:
         try:
-            response = await client.post(
-                f"{CORE_API}/events/local_offers_catalog_updated",
-                headers=headers,
-                json=data,
-            )
+            response = await client.post(f"{CORE_API}/events/local_offers_catalog_updated", headers=headers, json=data)
             response.raise_for_status()
         except Exception as exc:
             LOGGER.warning("No se pudo disparar evento en Home Assistant: %s", exc)
