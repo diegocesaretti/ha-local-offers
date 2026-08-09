@@ -1,6 +1,6 @@
 name: "Ofertas Locales"
 description: "Detecta catálogos de supermercados, extrae ofertas con LLM Vision y las integra con Home Assistant."
-version: "0.3.2"
+version: "0.3.3"
 slug: "local_offers"
 startup: application
 boot: auto
